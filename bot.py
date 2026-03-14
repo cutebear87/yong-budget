@@ -431,25 +431,32 @@ def main():
         print("ERROR: BOT_TOKEN environment variable not set!")
         return
 
+    print(f"Starting bot with token prefix: {TOKEN[:10]}...")
     init_db()
-    app = Application.builder().token(TOKEN).build()
+    print("Database initialized.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("add", add_expense))
-    app.add_handler(CommandHandler("income", add_income))
-    app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("spent", spent_cmd))
-    app.add_handler(CommandHandler("recent", recent))
-    app.add_handler(CommandHandler("delete", delete_cmd))
-    app.add_handler(CommandHandler("budget", budget_cmd))
-    app.add_handler(CommandHandler("budgets", budgets_cmd))
-    app.add_handler(CommandHandler("month", month_cmd))
-    app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-    print("🤖 Budget bot is running!")
-    app.run_polling()
+    try:
+        app = Application.builder().token(TOKEN).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", help_cmd))
+        app.add_handler(CommandHandler("add", add_expense))
+        app.add_handler(CommandHandler("income", add_income))
+        app.add_handler(CommandHandler("summary", summary))
+        app.add_handler(CommandHandler("spent", spent_cmd))
+        app.add_handler(CommandHandler("recent", recent))
+        app.add_handler(CommandHandler("delete", delete_cmd))
+        app.add_handler(CommandHandler("budget", budget_cmd))
+        app.add_handler(CommandHandler("budgets", budgets_cmd))
+        app.add_handler(CommandHandler("month", month_cmd))
+        app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
+        app.add_handler(MessageHandler(filters.COMMAND, unknown))
+        print("🤖 Budget bot is running!")
+        app.run_polling(drop_pending_updates=True)
+    except Exception as e:
+        print(f"FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
     main()
