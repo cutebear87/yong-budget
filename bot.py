@@ -1,7 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
@@ -9,10 +9,13 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import re
+import base64
+import httpx
 
 TOKEN        = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ALERT_THRESHOLD = 0.8  # 80% budget alert
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 CATS = [
     "Housing/Rent", "Groceries", "Dining Out", "Subscriptions",
@@ -167,6 +170,175 @@ def get_grade(pct_used):
     if pct_used <= 1.0:  return "D", "⚠️ Almost over budget!"
     return "F", "🔴 Over budget!"
 
+# ── REPLY KEYBOARD ───────────────────────────────────────────────────────────
+def main_keyboard():
+    keyboard = [
+        [KeyboardButton("📊 Summary"), KeyboardButton("📋 Spent")],
+        [KeyboardButton("🏆 Report"), KeyboardButton("🧾 Recent")],
+        [KeyboardButton("💰 Budgets"), KeyboardButton("🗑 Delete")],
+        [KeyboardButton("🔁 Recurring"), KeyboardButton("❓ Help")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+
+# ── RECEIPT SCANNER ──────────────────────────────────────────────────────────
+async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
+    """Send receipt image to Claude API and extract transaction details."""
+    if not ANTHROPIC_API_KEY:
+        return {"error": "ANTHROPIC_API_KEY not configured"}
+
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    payload = {
+        "model": "claude-opus-4-20250514",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": """Analyze this receipt image and extract the following information.
+Reply ONLY with a JSON object, no other text:
+{
+  "merchant": "store/restaurant name",
+  "total": 12.34,
+  "date": "YYYY-MM-DD or null if not visible",
+  "category": "one of: Groceries, Dining Out, Transportation, Entertainment, Subscriptions, Utilities, Housing/Rent, Savings, Personal/Shopping",
+  "items": ["item1 $x.xx", "item2 $x.xx"],
+  "confidence": "high/medium/low"
+}
+
+If you cannot read the receipt clearly, return:
+{"error": "Cannot read receipt clearly"}"""
+                    }
+                ],
+            }
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["content"][0]["text"].strip()
+        # Clean up any markdown code blocks
+        text = text.replace("```json", "").replace("```", "").strip()
+        import json
+        return json.loads(text)
+
+async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle photo messages — scan as receipt."""
+    chat_id = str(update.effective_chat.id)
+    added_by = update.effective_user.first_name or "Someone"
+
+    if not ANTHROPIC_API_KEY:
+        await update.message.reply_text(
+            "⚠️ Receipt scanning not configured yet.\nAsk Jonathan to add the ANTHROPIC_API_KEY!",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Send scanning message
+    scanning_msg = await update.message.reply_text("📸 Scanning receipt... give me a sec! ⏳")
+
+    try:
+        # Get the largest photo
+        photo = update.message.photo[-1]
+        photo_file = await ctx.bot.get_file(photo.file_id)
+
+        # Download image bytes
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(photo_file.file_path)
+            image_bytes = resp.content
+
+        # Send to Claude
+        result = await scan_receipt_with_claude(image_bytes)
+
+        if "error" in result:
+            await scanning_msg.edit_text(
+                f"😕 *Couldn't read that receipt*\n\n_{result['error']}_\n\nTry a clearer photo or use:\n`amount description`",
+                parse_mode="Markdown"
+            )
+            return
+
+        merchant  = result.get("merchant", "Unknown")
+        total     = float(result.get("total", 0))
+        category  = result.get("category", "Personal/Shopping")
+        items     = result.get("items", [])
+        date      = result.get("date") or datetime.now().strftime("%Y-%m-%d")
+        confidence = result.get("confidence", "medium")
+
+        if total <= 0:
+            await scanning_msg.edit_text(
+                "😕 *Couldn't find a total on this receipt.*\n\nTry a clearer photo!",
+                parse_mode="Markdown"
+            )
+            return
+
+        # Log the transaction
+        add_tx(chat_id, "expense", total, merchant, category, date, added_by)
+
+        icon = CAT_ICONS.get(category, "•")
+        conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
+
+        # Build items text
+        items_text = ""
+        if items:
+            items_text = "\n" + "\n".join(f"  • {item}" for item in items[:5])
+            if len(items) > 5:
+                items_text += f"\n  _...and {len(items)-5} more_"
+
+        # Category change keyboard
+        keyboard = []
+        row = []
+        for i, cat in enumerate(CATS):
+            icon2 = CAT_ICONS.get(cat, "•")
+            row.append(InlineKeyboardButton(
+                f"{icon2} {cat.split('/')[0]}",
+                callback_data=f"quickcat_{total}_{merchant[:20]}_{cat}"
+            ))
+            if len(row) == 2:
+                keyboard.append(row); row = []
+        if row: keyboard.append(row)
+
+        await scanning_msg.edit_text(
+            f"🧾 *Receipt Scanned!* {conf_emoji}\n"
+            f"{'─'*24}\n"
+            f"{icon} *{merchant}*{items_text}\n\n"
+            f"💸 Total: *{fmt(total)}*\n"
+            f"📁 Category: *{category}*\n"
+            f"👤 Added by {added_by}\n\n"
+            f"_Tap to change category if wrong:_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+        # Check budget alert
+        await check_budget_alert(update, ctx, chat_id, category)
+
+    except Exception as e:
+        print(f"Receipt scan error: {e}")
+        await scanning_msg.edit_text(
+            "😕 *Something went wrong scanning that receipt.*\n\nTry again or log manually:\n`amount description`",
+            parse_mode="Markdown"
+        )
+
 # ── SMART QUICK-ADD (just type amount + description) ─────────────────────────
 async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handles messages like '45.50 dinner at nobu' without /add prefix."""
@@ -229,11 +401,17 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     amount = float(parts[0])
     desc = parts[1]
     cat = "_".join(parts[2:])
+    # Delete the most recent transaction with same amount to avoid duplicates
+    txs = get_txs(chat_id)
+    for t in txs:
+        if t[3] == amount and t[4] == desc:
+            del_tx(t[0], chat_id)
+            break
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
     add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
     icon = CAT_ICONS.get(cat,"•")
-    await query.edit_message_text(f"✅ *Logged!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}", parse_mode="Markdown")
+    await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}", parse_mode="Markdown")
     await check_budget_alert_query(query, ctx, chat_id, cat)
 
 async def check_budget_alert(update, ctx, chat_id, cat):
@@ -283,7 +461,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📅 `/month 2026-02` — view past month\n"
         "🗑 `/delete` — delete a transaction\n"
         "❓ `/help` — all commands",
-        parse_mode="Markdown")
+        parse_mode="Markdown",
+        reply_markup=main_keyboard())
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -586,6 +765,24 @@ async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Use format YYYY-MM e.g. `2026-02`", parse_mode="Markdown"); return
     await summary(update, ctx, month=args[0])
 
+async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle persistent reply keyboard button taps."""
+    text = update.message.text
+    mapping = {
+        "📊 Summary": summary,
+        "📋 Spent": spent_cmd,
+        "🏆 Report": report_cmd,
+        "🧾 Recent": recent,
+        "💰 Budgets": budgets_cmd,
+        "🗑 Delete": delete_cmd,
+        "🔁 Recurring": recurring_cmd,
+        "❓ Help": help_cmd,
+    }
+    if text in mapping:
+        await mapping[text](update, ctx)
+    else:
+        await smart_add(update, ctx)
+
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤷 Unknown command. Type /help to see all commands.")
 
@@ -672,7 +869,8 @@ def main():
         app.add_handler(CallbackQueryHandler(delrec_callback, pattern="^delrec_"))
 
         # Smart quick-add (non-command messages)
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, smart_add))
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_keyboard))
         app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
         # Scheduler
