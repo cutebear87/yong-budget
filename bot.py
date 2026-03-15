@@ -189,7 +189,7 @@ async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
     payload = {
-        "model": "claude-opus-4-20250514",
+        "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
         "messages": [
             {
