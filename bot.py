@@ -300,7 +300,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Managing:*\n"
         "`/delete` — delete a transaction\n\n"
         "*Category shortcuts:*\n"
-        "`housing` `grocery` `dining` `sub`\n`transport` `util` `entertain` `saving` `personal`",
+        "`housing` — Housing/Rent\n`grocery` — Groceries\n`dining` — Dining Out\n`sub` — Subscriptions\n`transport` — Transportation\n`util` — Utilities\n`entertain` — Entertainment\n`saving` — Savings\n`personal` — Personal/Shopping",
         parse_mode="Markdown")
 
 async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
