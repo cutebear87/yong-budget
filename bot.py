@@ -262,9 +262,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         photo_file = await ctx.bot.get_file(photo.file_id)
 
-        # Download image bytes
+        # Download image bytes using Telegram's file URL with bot token
+        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{photo_file.file_path}"
         async with httpx.AsyncClient() as client:
-            resp = await client.get(photo_file.file_path)
+            resp = await client.get(file_url)
             image_bytes = resp.content
 
         # Send to Claude
