@@ -188,6 +188,17 @@ async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
 
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
+    # Detect media type from magic bytes
+    if image_bytes[:4] == b'\x89PNG':
+        media_type = "image/png"
+    elif image_bytes[:2] == b'\xff\xd8':
+        media_type = "image/jpeg"
+    elif image_bytes[:4] == b'RIFF':
+        media_type = "image/webp"
+    else:
+        media_type = "image/jpeg"  # default
+    print(f"Detected media type: {media_type}, size: {len(image_bytes)}")
+
     payload = {
         "model": "claude-sonnet-4-6",
         "max_tokens": 1024,
@@ -199,7 +210,7 @@ async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": "image/jpeg",
+                            "media_type": media_type,
                             "data": image_b64,
                         },
                     },
@@ -269,6 +280,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with httpx.AsyncClient() as client:
             resp = await client.get(file_url)
             image_bytes = resp.content
+
+        print(f"Downloaded image: {len(image_bytes)} bytes, url: {file_url[:80]}")
 
         # Send to Claude
         result = await scan_receipt_with_claude(image_bytes)
@@ -490,7 +503,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Managing:*\n"
         "`/delete` — delete a transaction\n\n"
         "*Category shortcuts:*\n"
-       "`housing` — Housing/Rent\n`grocery` — Groceries\n`dining` — Dining Out\n`sub` — Subscriptions\n`transport` — Transportation\n`util` — Utilities\n`entertain` — Entertainment\n`saving` — Savings\n`personal` — Personal/Shopping",
+        "`housing` `grocery` `dining` `sub`\n`transport` `util` `entertain` `saving` `personal`",
         parse_mode="Markdown")
 
 async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
