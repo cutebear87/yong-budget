@@ -190,12 +190,20 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         added_by = update.effective_user.first_name or "Someone"
         add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
         icon = CAT_ICONS.get(guessed_cat, "•")
+        # Build category picker in case they want to change
+        keyboard = []
+        row = []
+        for i, cat in enumerate(CATS):
+            icon2 = CAT_ICONS.get(cat, "•")
+            row.append(InlineKeyboardButton(f"{icon2} {cat.split('/')[0]}", callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"))
+            if len(row) == 2:
+                keyboard.append(row); row = []
+        if row: keyboard.append(row)
+
         await update.message.reply_text(
-            f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat} · {fmt(amount)}\n_Tap below if wrong category_",
+            f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat} · {fmt(amount)}\n_Tap below to change category_",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✏️ Change category", callback_data=f"recat_{update.message.message_id}_{amount}_{desc[:30]}")
-            ]])
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
         await check_budget_alert(update, ctx, chat_id, guessed_cat)
     else:
@@ -300,7 +308,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Managing:*\n"
         "`/delete` — delete a transaction\n\n"
         "*Category shortcuts:*\n"
-        "`housing` — Housing/Rent\n`grocery` — Groceries\n`dining` — Dining Out\n`sub` — Subscriptions\n`transport` — Transportation\n`util` — Utilities\n`entertain` — Entertainment\n`saving` — Savings\n`personal` — Personal/Shopping",
+        "`housing` `grocery` `dining` `sub`\n`transport` `util` `entertain` `saving` `personal`",
         parse_mode="Markdown")
 
 async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
