@@ -234,7 +234,9 @@ If you cannot read the receipt clearly, return:
             },
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code != 200:
+            print(f"Anthropic API error {response.status_code}: {response.text}")
+            return {"error": f"API error {response.status_code}: {response.text[:200]}"}
         data = response.json()
         text = data["content"][0]["text"].strip()
         # Clean up any markdown code blocks
