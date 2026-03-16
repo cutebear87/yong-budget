@@ -863,7 +863,7 @@ async def recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    txs = get_txs(chat_id)[:8]
+    txs = get_txs(chat_id)[:15]
     if not txs:
         await update.message.reply_text("No transactions to delete!", parse_mode="Markdown"); return
     keyboard = []
