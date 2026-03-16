@@ -945,6 +945,7 @@ async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _send_daily(query, chat_id, new_date, is_callback=True)
 
 
+async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle persistent reply keyboard button taps."""
     text = update.message.text
     mapping = {
