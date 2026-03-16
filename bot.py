@@ -275,14 +275,14 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         photo = update.message.photo[-1]
         photo_file = await ctx.bot.get_file(photo.file_id)
 
-        # Download image bytes using Telegram's file URL with bot token
-        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{photo_file.file_path}"
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(file_url)
-            image_bytes = resp.content
+       # Download using Telegram's built-in downloader
+        image_bytes = await photo_file.download_as_bytearray()
+        image_bytes = bytes(image_bytes)
 
-        print(f"Downloaded image: {len(image_bytes)} bytes, url: {file_url[:80]}")
+        print(f"Downloaded image: {len(image_bytes)} bytes")
 
+        if len(image_bytes) < 1000:
+            raise Exception(f"Downloaded image too small ({len(image_bytes)} bytes)")
         # Send to Claude
         result = await scan_receipt_with_claude(image_bytes)
 
