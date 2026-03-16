@@ -122,6 +122,17 @@ def del_recurring(r_id, chat_id):
     cur.execute(f"DELETE FROM recurring WHERE id={p} AND chat_id={p}", (r_id, chat_id))
     conn.commit(); conn.close()
 
+def get_txs_by_date(chat_id, date_str):
+    """Fetch all transactions for a specific date (YYYY-MM-DD)."""
+    conn, db_type = get_conn(); p = ph(db_type)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
+        f"FROM transactions WHERE chat_id={p} AND date={p} ORDER BY id ASC",
+        (chat_id, date_str)
+    )
+    rows = cur.fetchall(); conn.close(); return rows
+
 def get_all_chats():
     conn, db_type = get_conn()
     cur = conn.cursor()
@@ -475,6 +486,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔁 `/recurring` — manage recurring expenses\n"
         "💰 `/budget groceries 400` — set budget\n"
         "📅 `/month 2026-02` — view past month\n"
+        "📅 `/daily` — today's spending summary\n"
         "🗑 `/delete` — delete a transaction\n"
         "❓ `/help` — all commands",
         parse_mode="Markdown",
@@ -494,6 +506,7 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/spent` — category breakdown\n"
         "`/report` — report card with grade\n"
         "`/recent` — last 10 transactions\n"
+        "`/daily` — today's spending + date picker\n"
         "`/month YYYY-MM` — past month\n\n"
         "*Budgets:*\n"
         "`/budget <category> <amount>`\n"
@@ -789,7 +802,149 @@ async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Use format YYYY-MM e.g. `2026-02`", parse_mode="Markdown"); return
     await summary(update, ctx, month=args[0])
 
-async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show a daily spending summary with an inline date picker."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    await _send_daily(update, str(update.effective_chat.id), today, is_callback=False)
+
+async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback: bool):
+    """Build and send (or edit) the daily summary message."""
+    # ── data gathering ────────────────────────────────────────────────────────
+    txs        = get_txs_by_date(chat_id, date_str)
+    expenses   = [t for t in txs if t[2] == "expense"]
+    total_today = sum(t[3] for t in expenses)
+
+    month      = date_str[:7]
+    _, month_spent, by_cat_month = calc_summary(chat_id, month)
+    budgets    = get_budgets(chat_id)
+    total_budget = sum(budgets.values())
+
+    # daily average = month_spent / elapsed days
+    try:
+        day_num   = int(date_str[8:])
+        daily_avg = month_spent / day_num if day_num else 0
+    except Exception:
+        daily_avg = 0
+
+    # budget left today  (pro-rated daily budget minus today's spend)
+    try:
+        from calendar import monthrange
+        days_in_month = monthrange(int(date_str[:4]), int(date_str[5:7]))[1]
+        daily_budget_share = (total_budget / days_in_month) if total_budget else 0
+        budget_left_today  = daily_budget_share - total_today
+    except Exception:
+        daily_budget_share = 0
+        budget_left_today  = 0
+
+    # category breakdown for today
+    by_cat_today: dict = {}
+    for t in expenses:
+        by_cat_today[t[5]] = by_cat_today.get(t[5], 0) + t[3]
+
+    # ── format label ─────────────────────────────────────────────────────────
+    today_dt   = datetime.now().strftime("%Y-%m-%d")
+    date_dt    = datetime.strptime(date_str, "%Y-%m-%d")
+    if date_str == today_dt:
+        date_label = f"Today · {date_dt.strftime('%a, %d %b %Y')}"
+    elif date_str == (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
+        date_label = f"Yesterday · {date_dt.strftime('%a, %d %b %Y')}"
+    else:
+        date_label = date_dt.strftime("%A, %d %b %Y")
+
+    # ── build message ─────────────────────────────────────────────────────────
+    text = f"📅 *Daily Summary — {date_label}*\n{'─'*30}\n\n"
+
+    if not expenses:
+        text += "🎉 *No spending today!*\n_Great job keeping the wallet closed_ 👏\n\n"
+    else:
+        # transaction list
+        text += "*Transactions:*\n"
+        for t in expenses:
+            icon = CAT_ICONS.get(t[5], "•")
+            text += f"{icon} {fmt(t[3])}  _{t[4]}_  · `{t[5].split('/')[0]}`\n"
+        text += "\n"
+
+        # total today
+        text += f"💸 *Total today:* {fmt(total_today)}\n"
+
+        # vs daily average
+        if daily_avg > 0:
+            diff    = total_today - daily_avg
+            arrow   = "📈" if diff > 0 else "📉"
+            diff_str = f"+{fmt(abs(diff))}" if diff > 0 else f"-{fmt(abs(diff))}"
+            text += f"{arrow} vs daily avg: *{fmt(daily_avg)}*  ({diff_str})\n"
+
+        # category breakdown
+        if by_cat_today:
+            text += f"\n*By category:*\n"
+            for cat, amt in sorted(by_cat_today.items(), key=lambda x: -x[1]):
+                icon = CAT_ICONS.get(cat, "•")
+                month_cat_spent = by_cat_month.get(cat, 0)
+                bud = budgets.get(cat, 0)
+                if bud:
+                    pct = min((month_cat_spent / bud) * 100, 100)
+                    status = budget_status(pct)
+                    text += f"{icon} {cat}: *{fmt(amt)}*  {status} _{pct:.0f}% monthly budget used_\n"
+                else:
+                    text += f"{icon} {cat}: *{fmt(amt)}*\n"
+        text += "\n"
+
+    # ── budget left today line ────────────────────────────────────────────────
+    if total_budget and daily_budget_share > 0:
+        if budget_left_today >= 0:
+            text += f"✅ *Daily budget left:* {fmt(budget_left_today)}\n"
+        else:
+            text += f"⚠️ *Over daily budget by:* {fmt(abs(budget_left_today))}\n"
+
+    # ── monthly running total ─────────────────────────────────────────────────
+    text += f"\n📊 *{month_label(month)} so far:* {fmt(month_spent)}"
+    if total_budget:
+        pct_month = (month_spent / total_budget * 100)
+        text += f"  /  {fmt(total_budget)}  {budget_status(pct_month)}"
+    text += "\n"
+
+    # ── date picker inline keyboard ───────────────────────────────────────────
+    # show 5 days: 2 before, today, 2 after (capped to today)
+    pivot    = datetime.strptime(date_str, "%Y-%m-%d")
+    base_day = min(pivot, datetime.strptime(today_dt, "%Y-%m-%d"))
+    dates    = [base_day - timedelta(days=i) for i in range(4, -1, -1)]
+    date_row = []
+    for d in dates:
+        ds    = d.strftime("%Y-%m-%d")
+        label = d.strftime("%d/%m")
+        if ds == date_str:
+            label = f"[{label}]"
+        date_row.append(InlineKeyboardButton(label, callback_data=f"daily_{ds}"))
+
+    keyboard = [date_row, [InlineKeyboardButton("◀ Earlier", callback_data=f"daily_prev_{date_str}")]]
+
+    if is_callback:
+        await update_or_query.edit_message_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        await update_or_query.message.reply_text(
+            text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle date navigation in /daily."""
+    query = update.callback_query; await query.answer()
+    chat_id = str(update.effective_chat.id)
+    data    = query.data  # "daily_YYYY-MM-DD"  or  "daily_prev_YYYY-MM-DD"
+
+    if data.startswith("daily_prev_"):
+        # shift the window 5 days earlier
+        anchor    = datetime.strptime(data.replace("daily_prev_", ""), "%Y-%m-%d")
+        new_date  = (anchor - timedelta(days=5)).strftime("%Y-%m-%d")
+    else:
+        new_date = data.replace("daily_", "")
+
+    await _send_daily(query, chat_id, new_date, is_callback=True)
+
+
     """Handle persistent reply keyboard button taps."""
     text = update.message.text
     mapping = {
@@ -884,6 +1039,7 @@ def main():
         app.add_handler(CommandHandler("budgets", budgets_cmd))
         app.add_handler(CommandHandler("recurring", recurring_cmd))
         app.add_handler(CommandHandler("month", month_cmd))
+        app.add_handler(CommandHandler("daily", daily_cmd))
         app.add_handler(CommandHandler("help", help_cmd))
 
         # Callbacks
@@ -891,6 +1047,7 @@ def main():
         app.add_handler(CallbackQueryHandler(quickcat_callback, pattern="^quickcat_"))
         app.add_handler(CallbackQueryHandler(budcat_callback, pattern="^budcat_"))
         app.add_handler(CallbackQueryHandler(delrec_callback, pattern="^delrec_"))
+        app.add_handler(CallbackQueryHandler(daily_callback, pattern="^daily_"))
 
         # Smart quick-add (non-command messages)
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
