@@ -91,6 +91,27 @@ def del_tx(tx_id, chat_id):
     cur.execute(f"DELETE FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
     conn.commit(); conn.close()
 
+def update_tx_category(tx_id, chat_id, new_category: str):
+    conn, db_type = get_conn(); p = ph(db_type)
+    cur = conn.cursor()
+    cur.execute(
+        f"UPDATE transactions SET category={p} WHERE id={p} AND chat_id={p}",
+        (new_category, tx_id, chat_id),
+    )
+    conn.commit(); conn.close()
+
+def get_tx(tx_id, chat_id):
+    conn, db_type = get_conn(); p = ph(db_type)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
+        f"FROM transactions WHERE id={p} AND chat_id={p}",
+        (tx_id, chat_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
 def get_budgets(chat_id):
     conn, db_type = get_conn(); p = ph(db_type)
     cur = conn.cursor()
@@ -237,6 +258,20 @@ def gs_delete_tx(tx_id):
     except Exception as e:
         print(f"gs_delete_tx error: {e}")
 
+def gs_update_tx_category(tx_id, new_category):
+    """Update the Category cell for a matching transaction ID row."""
+    _, spreadsheet = _get_gs()
+    if not spreadsheet:
+        return
+    try:
+        ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        cell = ws.find(str(tx_id), in_column=1)
+        if cell:
+            # TX_HEADERS: ["ID", "Date", "Month", "Type", "Amount", "Category", "Description", "Added By"]
+            ws.update_cell(cell.row, 6, new_category)
+    except Exception as e:
+        print(f"gs_update_tx_category error: {e}")
+
 def gs_refresh_summary(chat_id):
     """Rewrite the Summary and Budget Tracker sheets from current DB state."""
     _, spreadsheet = _get_gs()
@@ -296,7 +331,7 @@ def gs_refresh_summary(chat_id):
 
 async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
                         type_=None, amount=None, cat=None, desc=None,
-                        added_by=None, delete=False):
+                        added_by=None, delete=False, update_category=False):
     """
     Non-blocking wrapper — runs the sync in a thread so it never delays
     Telegram responses.  Call with asyncio.create_task().
@@ -305,6 +340,8 @@ async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
     loop = asyncio.get_event_loop()
     if delete and tx_id:
         await loop.run_in_executor(None, gs_delete_tx, tx_id)
+    elif update_category and tx_id and cat:
+        await loop.run_in_executor(None, gs_update_tx_category, tx_id, cat)
     elif tx_id:
         await loop.run_in_executor(None, gs_append_tx,
                                    tx_id, date, month, type_,
@@ -493,6 +530,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Log the transaction
         tx_info = add_tx(chat_id, "expense", total, merchant, category, date, added_by)
         import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        tx_id = tx_info[0]
 
         icon = CAT_ICONS.get(category, "•")
         conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
@@ -511,7 +549,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             icon2 = CAT_ICONS.get(cat, "•")
             row.append(InlineKeyboardButton(
                 f"{icon2} {cat.split('/')[0]}",
-                callback_data=f"quickcat_{total}_{merchant[:20]}_{cat}"
+                callback_data=f"quickcat_{tx_id}_{cat}"
             ))
             if len(row) == 2:
                 keyboard.append(row); row = []
@@ -562,13 +600,14 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         added_by = update.effective_user.first_name or "Someone"
         tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
         import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        tx_id = tx_info[0]
         icon = CAT_ICONS.get(guessed_cat, "•")
         # Build category picker in case they want to change
         keyboard = []
         row = []
         for i, cat in enumerate(CATS):
             icon2 = CAT_ICONS.get(cat, "•")
-            row.append(InlineKeyboardButton(f"{icon2} {cat.split('/')[0]}", callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"))
+            row.append(InlineKeyboardButton(f"{icon2} {cat.split('/')[0]}", callback_data=f"quickcat_{tx_id}_{cat}"))
             if len(row) == 2:
                 keyboard.append(row); row = []
         if row: keyboard.append(row)
@@ -599,6 +638,33 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     chat_id = str(update.effective_chat.id)
     parts = query.data.replace("quickcat_","").split("_")
+    # Preferred format: quickcat_<tx_id>_<category>
+    # Legacy format (kept for compatibility): quickcat_<amount>_<desc>_<category>
+    updated_cat = "_".join(parts[1:]) if parts else ""
+    try:
+        maybe_id = int(parts[0])
+    except Exception:
+        maybe_id = None
+
+    if maybe_id is not None and updated_cat in CATS:
+        tx = get_tx(maybe_id, chat_id)
+        if not tx:
+            await query.edit_message_text("⚠️ Couldn't find that transaction anymore.", parse_mode="Markdown")
+            return
+        update_tx_category(maybe_id, chat_id, updated_cat)
+        import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
+        icon = CAT_ICONS.get(updated_cat, "•")
+        amount = tx[3]
+        desc = tx[4]
+        added_by = tx[7]
+        await query.edit_message_text(
+            f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}",
+            parse_mode="Markdown",
+        )
+        await check_budget_alert_query(query, ctx, chat_id, updated_cat)
+        return
+
+    # Legacy fallback
     amount = float(parts[0])
     desc = parts[1]
     cat = "_".join(parts[2:])
@@ -721,6 +787,7 @@ async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tx_info = add_tx(chat_id, "expense", amount, desc, matched_cat, date, added_by)
     import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     icon = CAT_ICONS.get(matched_cat, "•")
+    budgets = get_budgets(chat_id)
     _, spent, by_cat = calc_summary(chat_id)
     cat_spent = by_cat.get(matched_cat, 0)
     cat_budget = budgets.get(matched_cat, 0)
