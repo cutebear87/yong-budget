@@ -16,6 +16,8 @@ TOKEN        = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ALERT_THRESHOLD = 0.8  # 80% budget alert
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS", "")   # service account JSON string
+GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")       # spreadsheet ID from URL
 
 CATS = [
     "Housing/Rent", "Groceries", "Dining Out", "Subscriptions",
@@ -80,7 +82,8 @@ def add_tx(chat_id, type_, amount, desc, cat, date, added_by):
     cur = conn.cursor()
     cur.execute(f"INSERT INTO transactions (id,chat_id,type,amount,description,category,date,added_by,month) VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})", (tx_id,chat_id,type_,amount,desc,cat,date,added_by,month))
     conn.commit(); conn.close()
-    return tx_id
+    # Return full tuple so callers can fire the sheets sync
+    return tx_id, date, month, type_, amount, cat, desc, added_by
 
 def del_tx(tx_id, chat_id):
     conn, db_type = get_conn(); p = ph(db_type)
@@ -140,7 +143,176 @@ def get_all_chats():
     rows = cur.fetchall(); conn.close()
     return [r[0] for r in rows]
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
+_gs_client = None   # gspread client (lazy init)
+_gs_sheet  = None   # spreadsheet object (lazy init)
+
+SHEET_TX      = "Transactions"
+SHEET_SUMMARY = "Summary"
+SHEET_BUDGET  = "Budget Tracker"
+
+TX_HEADERS  = ["ID", "Date", "Month", "Type", "Amount", "Category", "Description", "Added By"]
+SUM_HEADERS = ["Month", "Category", "Total Spent", "Budget", "% Used", "Status"]
+BUD_HEADERS = ["Category", "Monthly Budget", "This Month Spent", "Remaining", "% Used", "Status"]
+
+def _get_gs():
+    """Return (client, spreadsheet) — lazy-initialise once per process."""
+    global _gs_client, _gs_sheet
+    if _gs_sheet is not None:
+        return _gs_client, _gs_sheet
+    if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
+        return None, None
+    try:
+        import gspread, json
+        from google.oauth2.service_account import Credentials
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        info  = json.loads(GOOGLE_SHEETS_CREDS)
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        _gs_client = gspread.authorize(creds)
+        _gs_sheet  = _gs_client.open_by_key(GOOGLE_SHEET_ID)
+        _ensure_sheets(_gs_sheet)
+        print("Google Sheets connected OK.")
+    except Exception as e:
+        print(f"Google Sheets init error: {e}")
+        _gs_client = _gs_sheet = None
+    return _gs_client, _gs_sheet
+
+def _get_or_create_ws(spreadsheet, title, headers):
+    """Return worksheet by title, creating it with headers if missing."""
+    try:
+        ws = spreadsheet.worksheet(title)
+    except Exception:
+        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+        _fmt_header(ws)
+    return ws
+
+def _fmt_header(ws):
+    """Bold + freeze the header row."""
+    try:
+        ws.format("1:1", {"textFormat": {"bold": True}})
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
+def _ensure_sheets(spreadsheet):
+    """Make sure all three worksheets exist with headers."""
+    _get_or_create_ws(spreadsheet, SHEET_TX,      TX_HEADERS)
+    _get_or_create_ws(spreadsheet, SHEET_SUMMARY,  SUM_HEADERS)
+    _get_or_create_ws(spreadsheet, SHEET_BUDGET,   BUD_HEADERS)
+    # Remove the default 'Sheet1' if it still exists
+    try:
+        default = spreadsheet.worksheet("Sheet1")
+        spreadsheet.del_worksheet(default)
+    except Exception:
+        pass
+
+def gs_append_tx(tx_id, date, month, type_, amount, cat, desc, added_by):
+    """Append one row to the Transactions sheet."""
+    _, spreadsheet = _get_gs()
+    if not spreadsheet:
+        return
+    try:
+        ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        ws.append_row(
+            [str(tx_id), date, month, type_, amount, cat, desc, added_by],
+            value_input_option="USER_ENTERED"
+        )
+    except Exception as e:
+        print(f"gs_append_tx error: {e}")
+
+def gs_delete_tx(tx_id):
+    """Find and delete the row with matching transaction ID."""
+    _, spreadsheet = _get_gs()
+    if not spreadsheet:
+        return
+    try:
+        ws   = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        cell = ws.find(str(tx_id), in_column=1)
+        if cell:
+            ws.delete_rows(cell.row)
+    except Exception as e:
+        print(f"gs_delete_tx error: {e}")
+
+def gs_refresh_summary(chat_id):
+    """Rewrite the Summary and Budget Tracker sheets from current DB state."""
+    _, spreadsheet = _get_gs()
+    if not spreadsheet:
+        return
+    try:
+        month   = get_month()
+        budgets = get_budgets(chat_id)
+
+        # ── Summary tab: last 3 months × all categories ───────────────────
+        ws_sum = _get_or_create_ws(spreadsheet, SHEET_SUMMARY, SUM_HEADERS)
+        ws_sum.clear()
+        ws_sum.append_row(SUM_HEADERS, value_input_option="USER_ENTERED")
+        _fmt_header(ws_sum)
+
+        months_to_show = []
+        dt = datetime.strptime(month, "%Y-%m")
+        for i in range(3):
+            months_to_show.append((dt - timedelta(days=30*i)).strftime("%Y-%m"))
+
+        sum_rows = []
+        for m in months_to_show:
+            _, _, by_cat = calc_summary(chat_id, m)
+            for cat in CATS:
+                spent = by_cat.get(cat, 0)
+                bud   = budgets.get(cat, 0)
+                if not spent and not bud:
+                    continue
+                pct    = round(spent / bud * 100, 1) if bud else ""
+                status = ("🔴 Over" if spent > bud else "🟡 Warning" if bud and spent/bud >= 0.8 else "🟢 OK") if bud else "—"
+                sum_rows.append([m, cat, spent, bud if bud else "", pct, status])
+        if sum_rows:
+            ws_sum.append_rows(sum_rows, value_input_option="USER_ENTERED")
+
+        # ── Budget Tracker tab: current month ─────────────────────────────
+        ws_bud = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
+        ws_bud.clear()
+        ws_bud.append_row(BUD_HEADERS, value_input_option="USER_ENTERED")
+        _fmt_header(ws_bud)
+
+        _, _, by_cat_now = calc_summary(chat_id, month)
+        bud_rows = []
+        for cat in CATS:
+            spent = by_cat_now.get(cat, 0)
+            bud   = budgets.get(cat, 0)
+            if not spent and not bud:
+                continue
+            remaining = (bud - spent) if bud else ""
+            pct       = round(spent / bud * 100, 1) if bud else ""
+            status    = ("🔴 Over" if spent > bud else "🟡 Warning" if bud and spent/bud >= 0.8 else "🟢 OK") if bud else "—"
+            bud_rows.append([cat, bud if bud else "", spent, remaining, pct, status])
+        if bud_rows:
+            ws_bud.append_rows(bud_rows, value_input_option="USER_ENTERED")
+
+    except Exception as e:
+        print(f"gs_refresh_summary error: {e}")
+
+async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
+                        type_=None, amount=None, cat=None, desc=None,
+                        added_by=None, delete=False):
+    """
+    Non-blocking wrapper — runs the sync in a thread so it never delays
+    Telegram responses.  Call with asyncio.create_task().
+    """
+    import asyncio
+    loop = asyncio.get_event_loop()
+    if delete and tx_id:
+        await loop.run_in_executor(None, gs_delete_tx, tx_id)
+    elif tx_id:
+        await loop.run_in_executor(None, gs_append_tx,
+                                   tx_id, date, month, type_,
+                                   amount, cat, desc, added_by)
+    # Always refresh summary/budget tabs
+    await loop.run_in_executor(None, gs_refresh_summary, chat_id)
+
+
 def fmt(n): return f"${n:,.2f}"
 def fmt_short(n): return f"${n:,.0f}" if n == int(n) else f"${n:,.2f}"
 def get_month(): return datetime.now().strftime("%Y-%m")
@@ -319,7 +491,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         # Log the transaction
-        add_tx(chat_id, "expense", total, merchant, category, date, added_by)
+        tx_info = add_tx(chat_id, "expense", total, merchant, category, date, added_by)
+        import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
 
         icon = CAT_ICONS.get(category, "•")
         conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
@@ -387,7 +560,8 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Auto-log with guessed category
         date = datetime.now().strftime("%Y-%m-%d")
         added_by = update.effective_user.first_name or "Someone"
-        add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
+        tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
+        import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         icon = CAT_ICONS.get(guessed_cat, "•")
         # Build category picker in case they want to change
         keyboard = []
@@ -433,10 +607,12 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for t in txs:
         if t[3] == amount and t[4] == desc:
             del_tx(t[0], chat_id)
+            import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
             break
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
-    add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
+    tx_info = add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
+    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     icon = CAT_ICONS.get(cat,"•")
     await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}", parse_mode="Markdown")
     await check_budget_alert_query(query, ctx, chat_id, cat)
@@ -542,10 +718,9 @@ async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc = " ".join(args[2:]) if len(args) > 2 else matched_cat
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
-    add_tx(chat_id, "expense", amount, desc, matched_cat, date, added_by)
-
+    tx_info = add_tx(chat_id, "expense", amount, desc, matched_cat, date, added_by)
+    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     icon = CAT_ICONS.get(matched_cat, "•")
-    budgets = get_budgets(chat_id)
     _, spent, by_cat = calc_summary(chat_id)
     cat_spent = by_cat.get(matched_cat, 0)
     cat_budget = budgets.get(matched_cat, 0)
@@ -572,7 +747,8 @@ async def add_income(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     desc = " ".join(args[1:]) if len(args) > 1 else "Income"
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
-    add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
+    tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
+    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     await update.message.reply_text(
         f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",
         parse_mode="Markdown")
@@ -704,7 +880,9 @@ async def delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     if query.data == "del_cancel":
         await query.edit_message_text("Cancelled."); return
-    del_tx(int(query.data.replace("del_","")), chat_id)
+    tx_id = int(query.data.replace("del_",""))
+    del_tx(tx_id, chat_id)
+    import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, delete=True))
     await query.edit_message_text("✅ Transaction deleted.")
 
 async def budget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1005,7 +1183,8 @@ async def process_recurring(app):
         for r in recurrings:
             if r[5] == today.day:
                 date = today.strftime("%Y-%m-%d")
-                add_tx(chat_id, "expense", r[2], r[3], r[4], date, "Auto")
+                tx_info = add_tx(chat_id, "expense", r[2], r[3], r[4], date, "Auto")
+                await gs_sync_async(chat_id, *tx_info)
                 icon = CAT_ICONS.get(r[4],"•")
                 try:
                     await app.bot.send_message(
