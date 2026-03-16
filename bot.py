@@ -850,7 +850,7 @@ async def spent_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    txs = get_txs(chat_id)[:10]
+    txs = get_txs(chat_id)[:15]
     if not txs:
         await update.message.reply_text("No transactions this month yet!\n\nJust type an amount to log one!\ne.g. `45.50 dinner`", parse_mode="Markdown"); return
     text = f"🧾 *Recent Transactions*\n{'─'*28}\n\n"
