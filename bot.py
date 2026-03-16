@@ -267,24 +267,21 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Send scanning message
     scanning_msg = await update.message.reply_text("📸 Scanning receipt... give me a sec! ⏳")
 
     try:
-        # Get highest resolution photo
+        # Get the largest photo
         photo = update.message.photo[-1]
-
-        # Get Telegram file object
         photo_file = await ctx.bot.get_file(photo.file_id)
 
-        # Download using Telegram's built-in downloader (SAFEST METHOD)
-        image_bytes = await photo_file.download_as_bytearray()
-        image_bytes = bytes(image_bytes)
+        # Download image bytes using Telegram's file URL with bot token
+        file_url = f"https://api.telegram.org/file/bot{TOKEN}/{photo_file.file_path}"
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(file_url)
+            image_bytes = resp.content
 
-        print(f"Downloaded image: {len(image_bytes)} bytes")
-
-        # Safety check — prevent broken files
-        if len(image_bytes) < 1000:
-            raise Exception(f"Downloaded image too small ({len(image_bytes)} bytes)")
+        print(f"Downloaded image: {len(image_bytes)} bytes, url: {file_url[:80]}")
 
         # Send to Claude
         result = await scan_receipt_with_claude(image_bytes)
@@ -316,29 +313,25 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         icon = CAT_ICONS.get(category, "•")
         conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
 
-        # Build item preview
+        # Build items text
         items_text = ""
         if items:
             items_text = "\n" + "\n".join(f"  • {item}" for item in items[:5])
             if len(items) > 5:
                 items_text += f"\n  _...and {len(items)-5} more_"
 
-        # Category correction buttons
+        # Category change keyboard
         keyboard = []
         row = []
-        for cat in CATS:
+        for i, cat in enumerate(CATS):
             icon2 = CAT_ICONS.get(cat, "•")
-            row.append(
-                InlineKeyboardButton(
-                    f"{icon2} {cat.split('/')[0]}",
-                    callback_data=f"quickcat_{total}_{merchant[:20]}_{cat}"
-                )
-            )
+            row.append(InlineKeyboardButton(
+                f"{icon2} {cat.split('/')[0]}",
+                callback_data=f"quickcat_{total}_{merchant[:20]}_{cat}"
+            ))
             if len(row) == 2:
-                keyboard.append(row)
-                row = []
-        if row:
-            keyboard.append(row)
+                keyboard.append(row); row = []
+        if row: keyboard.append(row)
 
         await scanning_msg.edit_text(
             f"🧾 *Receipt Scanned!* {conf_emoji}\n"
@@ -352,6 +345,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+        # Check budget alert
         await check_budget_alert(update, ctx, chat_id, category)
 
     except Exception as e:
@@ -509,7 +503,15 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Managing:*\n"
         "`/delete` — delete a transaction\n\n"
         "*Category shortcuts:*\n"
-        "`housing` `grocery` `dining` `sub`\n`transport` `util` `entertain` `saving` `personal`",
+        "`housing` — Housing/Rent\n"
+        "`grocery` — Groceries\n"
+        "`dining` — Dining Out\n"
+        "`sub` — Subscriptions\n"
+        "`transport` — Transportation\n"
+        "`util` — Utilities\n"
+        "`entertain` — Entertainment\n"
+        "`saving` — Savings\n"
+        "`personal` — Personal/Shopping",
         parse_mode="Markdown")
 
 async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
