@@ -422,10 +422,6 @@ def _refresh_budget_sheet(spreadsheet, chat_id, month):
     _, _, by_cat = calc_summary(chat_id, month)
 
     ws = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
-    ws.clear()
-    ws.append_row(BUD_HEADERS, value_input_option="USER_ENTERED")
-    _fmt_header_row(ws, len(BUD_HEADERS))
-
     bud_rows  = []
     row_colors = []
 
@@ -451,7 +447,12 @@ def _refresh_budget_sheet(spreadsheet, chat_id, month):
     bud_rows.append(["TOTAL", total_bud, round(total_spent, 2), total_rem, _progress_bar_str(total_pct), total_pct, _status_text(total_pct)])
     row_colors.append(_WHITE)
 
-    ws.append_rows(bud_rows, value_input_option="USER_ENTERED")
+    # Write header + all data rows in one updateCells call
+    def _cv(v):
+        if isinstance(v, (int, float)): return {"userEnteredValue": {"numberValue": v}}
+        return {"userEnteredValue": {"stringValue": str(v)}}
+    all_rows = [BUD_HEADERS] + bud_rows
+    cell_rows_data = [{"values": [_cv(v) for v in r]} for r in all_rows]
 
     data_end = len(bud_rows) + 1
     _fmt_col_currency(ws, "B", 2, data_end)
@@ -495,11 +496,67 @@ def _refresh_budget_sheet(spreadsheet, chat_id, month):
             }
         })
 
-    if requests:
-        spreadsheet.batch_update({"requests": requests})
+    # Single batch_update: clear + write data + all formatting
+    col_fmt_requests = []
+    sheet_id = ws.id
+    def _currency_req(col_idx, r1, r2):
+        return {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
+                      "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "CURRENCY", "pattern": '"$"#,##0.00'}}},
+            "fields": "userEnteredFormat.numberFormat"
+        }}
+    def _pct_req(col_idx, r1, r2):
+        return {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
+                      "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
+            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '0.0"%"'}}},
+            "fields": "userEnteredFormat.numberFormat"
+        }}
 
-    _add_filter(ws, len(BUD_HEADERS))
-    _autofit_cols(ws, len(BUD_HEADERS))
+    r2 = data_end
+    col_fmt_requests += [
+        _currency_req(1, 1, r2),  # col B
+        _currency_req(2, 1, r2),  # col C
+        _currency_req(3, 1, r2),  # col D
+        _pct_req(5, 1, r2),       # col F
+        {"setBasicFilter": {"filter": {"range": {
+            "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)
+        }}}},
+        {"autoResizeDimensions": {"dimensions": {
+            "sheetId": sheet_id, "dimension": "COLUMNS",
+            "startIndex": 0, "endIndex": len(BUD_HEADERS)
+        }}},
+    ]
+
+    all_requests = [
+        # Clear sheet first
+        {"updateCells": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                      "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)},
+            "fields": "userEnteredValue,userEnteredFormat",
+        }},
+        # Write header + data
+        {"updateCells": {
+            "rows": cell_rows_data,
+            "fields": "userEnteredValue",
+            "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
+        }},
+        # Header formatting
+        {"repeatCell": {
+            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                      "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)},
+            "cell": {"userEnteredFormat": {
+                "backgroundColor": _HEADER,
+                "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 10},
+                "horizontalAlignment": "CENTER",
+            }},
+            "fields": "userEnteredFormat",
+        }},
+    ] + requests + col_fmt_requests
+    if all_requests:
+        spreadsheet.batch_update({"requests": all_requests})
 
 # ── Summary sheet ─────────────────────────────────────────────────────────────
 def _refresh_summary_sheet(spreadsheet, chat_id):
@@ -571,274 +628,98 @@ def _refresh_summary_sheet(spreadsheet, chat_id):
                     "fields": "userEnteredFormat.backgroundColor",
                 }
             })
-        if requests:
-            spreadsheet.batch_update({"requests": requests})
+        # Merge row colours + filter + autofit into one batch_update
+        sheet_id = ws.id
+        extra = [
+            {"setBasicFilter": {"filter": {"range": {
+                "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                "startColumnIndex": 0, "endColumnIndex": len(headers)
+            }}}},
+            {"autoResizeDimensions": {"dimensions": {
+                "sheetId": sheet_id, "dimension": "COLUMNS",
+                "startIndex": 0, "endIndex": len(headers)
+            }}},
+        ]
 
-    _add_filter(ws, len(headers))
-    _autofit_cols(ws, len(headers))
+        # Also consolidate currency/pct formatting inline
+        def _cr(col_idx, r1, r2, fmt_type, pattern):
+            return {"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
+                          "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
+                "cell": {"userEnteredFormat": {"numberFormat": {"type": fmt_type, "pattern": pattern}}},
+                "fields": "userEnteredFormat.numberFormat"
+            }}
+        cur_cols = [1, 2, 4, 5, 7, 8, 10]   # B,C,E,F,H,I,K
+        pct_cols = [3, 6, 9]                  # D,G,J
+        for c in cur_cols:
+            extra.append(_cr(c, 1, data_end, "CURRENCY", '"$"#,##0.00'))
+        for c in pct_cols:
+            extra.append(_cr(c, 1, data_end, "NUMBER", '0.0"%"'))
+
+        all_reqs = requests + extra
+        if all_reqs:
+            spreadsheet.batch_update({"requests": all_reqs})
 
 # ── Dashboard sheet ───────────────────────────────────────────────────────────
-def _delete_all_charts(spreadsheet, sheet_id):
-    """Remove all existing charts from a sheet so we don't stack duplicates on refresh."""
-    try:
-        meta = spreadsheet.fetch_sheet_metadata()
-        sheets = meta.get("sheets", [])
-        for s in sheets:
-            if s["properties"]["sheetId"] == sheet_id:
-                charts = s.get("charts", [])
-                if not charts:
-                    return
-                reqs = [{"deleteEmbeddedObject": {"objectId": c["chartId"]}} for c in charts]
-                spreadsheet.batch_update({"requests": reqs})
-                return
-    except Exception as e:
-        print(f"_delete_all_charts error: {e}")
-
-def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
-    """
-    Embed three charts on the Dashboard sheet anchored to column H:
-      - Donut : spending by category   (H1)
-      - Bar   : spent vs budget        (H22)
-      - Line  : 3-month spend trend    (H43)
-    months_data = [(label, spent_dict), ...] ordered oldest → newest
-
-    Strategy: write all scratch data to cols I–Z (hidden area) FIRST in one
-    batch_update, then issue the addChart requests in a second batch_update.
-    This avoids the race condition where chart ranges are referenced before
-    the data cells exist.
-    """
-    sheet_id = ws.id
-
-    active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
-    spending_cats = [c for c in active_cats if by_cat.get(c, 0) > 0]
-    if not active_cats:
-        return
-
-    # ── Scratch layout (col I = index 8, all 0-indexed) ───────────────────────
-    # Row 1  (idx 0): pie category labels
-    # Row 2  (idx 1): pie category values
-    # Row 4  (idx 3): bar category labels
-    # Row 5  (idx 4): bar budget values
-    # Row 6  (idx 5): bar spent values
-    # Row 8  (idx 7): line month labels
-    # Row 9  (idx 8): line total spent per month
-    # Row 10 (idx 9): line budget reference (flat)
-
-    SC = 8  # scratch start column index (col I)
-
-    pie_labels     = [c for c in spending_cats]
-    pie_values     = [round(by_cat.get(c, 0), 2) for c in spending_cats]
-    bar_labels     = active_cats
-    bar_budgets_v  = [budgets.get(c, 0) for c in active_cats]
-    bar_spent_v    = [round(by_cat.get(c, 0), 2) for c in active_cats]
-    line_labels    = [m[0] for m in months_data]
-    line_spent     = [round(sum(m[1].values()), 2) for m in months_data]
-    total_budget   = sum(budgets.values())
-    line_budget    = [total_budget] * len(months_data)
-
-    nc  = len(active_cats)
-    npc = len(spending_cats)
-    nm  = len(months_data)
-
-    # ── STEP 1: write all scratch data in one call ────────────────────────────
-    scratch_grid = [
-        pie_labels  + [""] * (max(nc, nm) - npc),   # row 1  (idx 0)
-        pie_values  + [""] * (max(nc, nm) - npc),   # row 2  (idx 1)
-        [""],                                         # row 3  (idx 2) spacer
-        bar_labels,                                   # row 4  (idx 3)
-        bar_budgets_v,                                # row 5  (idx 4)
-        bar_spent_v,                                  # row 6  (idx 5)
-        [""],                                         # row 7  (idx 6) spacer
-        line_labels,                                  # row 8  (idx 7)
-        line_spent,                                   # row 9  (idx 8)
-        line_budget,                                  # row 10 (idx 9)
-    ]
-
-    # Pad all rows to same width
-    max_w = max(len(r) for r in scratch_grid)
-    scratch_grid = [r + [""] * (max_w - len(r)) for r in scratch_grid]
-
-    # Convert to Sheets batchUpdate updateCells request (bypasses gspread rate limits)
-    def _cell(v):
-        if isinstance(v, (int, float)):
-            return {"userEnteredValue": {"numberValue": v}}
-        return {"userEnteredValue": {"stringValue": str(v)}}
-
-    rows_data = [{"values": [_cell(v) for v in row]} for row in scratch_grid]
-
-    write_req = {
-        "updateCells": {
-            "rows": rows_data,
-            "fields": "userEnteredValue",
-            "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": SC},
-        }
-    }
-
-    try:
-        print(f"[CHARTS] Writing scratch data: {len(scratch_grid)} rows x {max_w} cols starting at col {SC}")
-        result = spreadsheet.batch_update({"requests": [write_req]})
-        print(f"[CHARTS] Scratch write OK: {result.get('spreadsheetId','?')}")
-    except Exception as e:
-        import traceback
-        print(f"[CHARTS] Chart scratch write error: {e}")
-        print(traceback.format_exc())
-        return
-
-    # ── STEP 2: build chart specs referencing the now-committed ranges ────────
-    def src(r1, r2, c1, c2):
-        return {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
-                "startColumnIndex": c1, "endColumnIndex": c2}
-
-    def anchor(row, col=8):  # col 8 = column I (0-indexed) — charts sit right of data
-        return {
-            "overlayPosition": {
-                "anchorCell": {"sheetId": sheet_id, "rowIndex": row, "columnIndex": col},
-                "offsetXPixels": 10, "offsetYPixels": 0,
-                "widthPixels": 500, "heightPixels": 280,
-            }
-        }
-
-    # Donut — rows 1-2, SC..SC+npc
-    donut_req = {
-        "spec": {
-            "title": f"Spending by category — {month_label()}",
-            "titleTextFormat": {"bold": True, "fontSize": 11},
-            "pieChart": {
-                "legendPosition": "RIGHT_LEGEND",
-                "pieHole": 0.5,
-                "domain": {"data": {"sourceRange": {"sources": [src(0, 1, SC, SC + npc)]}}},
-                "series": {"data": {"sourceRange": {"sources": [src(1, 2, SC, SC + npc)]}}},
-            },
-        },
-        "position": anchor(1),
-    }
-
-    # Bar — rows 4-6, SC..SC+nc
-    bar_req = {
-        "spec": {
-            "title": "Spent vs budget by category",
-            "titleTextFormat": {"bold": True, "fontSize": 11},
-            "basicChart": {
-                "chartType": "BAR",
-                "legendPosition": "BOTTOM_LEGEND",
-                "axis": [
-                    {"position": "BOTTOM_AXIS", "title": "SGD ($)"},
-                    {"position": "LEFT_AXIS",   "title": "Category"},
-                ],
-                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(3, 4, SC, SC + nc)]}}}}],
-                "series": [
-                    {
-                        "series": {"data": {"sourceRange": {"sources": [src(4, 5, SC, SC + nc)]}}},
-                        "targetAxis": "BOTTOM_AXIS",
-                        "color": {"red": 0.204, "green": 0.659, "blue": 0.325},
-                    },
-                    {
-                        "series": {"data": {"sourceRange": {"sources": [src(5, 6, SC, SC + nc)]}}},
-                        "targetAxis": "BOTTOM_AXIS",
-                        "color": {"red": 0.918, "green": 0.263, "blue": 0.208},
-                    },
-                ],
-                "headerCount": 1,
-            },
-        },
-        "position": anchor(22),
-    }
-
-    # Line — rows 8-10, SC..SC+nm
-    line_req = {
-        "spec": {
-            "title": "3-month spending trend",
-            "titleTextFormat": {"bold": True, "fontSize": 11},
-            "basicChart": {
-                "chartType": "LINE",
-                "legendPosition": "BOTTOM_LEGEND",
-                "axis": [
-                    {"position": "BOTTOM_AXIS", "title": "Month"},
-                    {"position": "LEFT_AXIS",   "title": "SGD ($)"},
-                ],
-                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(7, 8, SC, SC + nm)]}}}}],
-                "series": [
-                    {
-                        "series": {"data": {"sourceRange": {"sources": [src(8, 9, SC, SC + nm)]}}},
-                        "targetAxis": "LEFT_AXIS",
-                        "color": {"red": 0.259, "green": 0.522, "blue": 0.957},
-                    },
-                    {
-                        "series": {"data": {"sourceRange": {"sources": [src(9, 10, SC, SC + nm)]}}},
-                        "targetAxis": "LEFT_AXIS",
-                        "color": {"red": 0.7, "green": 0.7, "blue": 0.7},
-                    },
-                ],
-                "headerCount": 1,
-            },
-        },
-        "position": anchor(43),
-    }
-
-    # ── STEP 3: create all three charts in one batch ──────────────────────────
-    try:
-        print(f"[CHARTS] sheet_id={sheet_id}, npc={npc}, nc={nc}, nm={nm}, SC={SC}")
-        print(f"[CHARTS] pie_labels={pie_labels}")
-        print(f"[CHARTS] bar_labels={bar_labels}")
-        print(f"[CHARTS] line_labels={line_labels}, line_spent={line_spent}")
-        result = spreadsheet.batch_update({"requests": [
-            {"addChart": {"chart": donut_req}},
-            {"addChart": {"chart": bar_req}},
-            {"addChart": {"chart": line_req}},
-        ]})
-        print(f"[CHARTS] batch_update result: {result}")
-        print("Charts added successfully.")
-    except Exception as e:
-        import traceback
-        print(f"[CHARTS] _add_charts error: {e}")
-        print(traceback.format_exc())
-
-
 def _refresh_dashboard(spreadsheet, chat_id):
-    """Write dashboard data then add charts. Each step logged independently."""
-    month   = get_month()
-    budgets = get_budgets(chat_id)
-    _, _, by_cat = calc_summary(chat_id, month)
-
-    # Step 1: delete old charts BEFORE clearing/rewriting the sheet
-    try:
-        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
-        _delete_all_charts(spreadsheet, ws.id)
-    except Exception as e:
-        print(f"_refresh_dashboard delete charts error: {e}")
-
-    # Step 2: write dashboard data + scratch rows
+    """Write dashboard data only."""
     try:
         _refresh_dashboard_data(spreadsheet, chat_id)
     except Exception as e:
-        print(f"_refresh_dashboard data error: {e}")
-        return
-
-    # Step 3: add charts — scratch data is now committed
-    try:
-        dt = datetime.strptime(month, "%Y-%m")
-        months_list = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
-        months_data = [
-            (datetime.strptime(m, "%Y-%m").strftime("%b %Y"), calc_summary(chat_id, m)[2])
-            for m in months_list
-        ]
-        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
-        _add_charts(spreadsheet, ws, by_cat, budgets, months_data)
-    except Exception as e:
-        print(f"_refresh_dashboard charts error: {e}")
+        print(f"_refresh_dashboard error: {e}")
 
 # ── Master refresh ────────────────────────────────────────────────────────────
+def _sheets_call(fn, *args, retries=4, **kwargs):
+    """
+    Call a Google Sheets API function with exponential backoff on 429 / 503.
+    Waits 15s, 30s, 60s, 120s before giving up.
+    """
+    import time
+    delays = [15, 30, 60, 120]
+    for attempt, delay in enumerate(delays):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "503" in msg or "Quota" in msg or "quota" in msg:
+                if attempt < len(delays) - 1:
+                    print(f"[SHEETS] Rate limited, retrying in {delay}s... ({msg[:80]})")
+                    time.sleep(delay)
+                    continue
+            raise  # non-quota error — re-raise immediately
+    raise RuntimeError("Sheets API quota exceeded after all retries")
+
+
 def gs_refresh_summary(chat_id):
+    import time
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
+    month = get_month()
+
+    # Run each tab refresh through the retry wrapper.
+    # Sleep 5s between tabs to spread writes across time.
     try:
-        month = get_month()
-        _refresh_budget_sheet(spreadsheet, chat_id, month)
-        _refresh_summary_sheet(spreadsheet, chat_id)
-        _refresh_dashboard(spreadsheet, chat_id)
+        _sheets_call(_refresh_budget_sheet, spreadsheet, chat_id, month)
+        print("Budget sheet OK")
     except Exception as e:
-        print(f"gs_refresh_summary error: {e}")
+        print(f"Budget sheet error: {e}")
+
+    time.sleep(5)
+
+    try:
+        _sheets_call(_refresh_summary_sheet, spreadsheet, chat_id)
+        print("Summary sheet OK")
+    except Exception as e:
+        print(f"Summary sheet error: {e}")
+
+    time.sleep(5)
+
+    try:
+        _sheets_call(_refresh_dashboard, spreadsheet, chat_id)
+        print("Dashboard OK")
+    except Exception as e:
+        print(f"Dashboard error: {e}")
 
 async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
                         type_=None, amount=None, cat=None, desc=None,
@@ -1674,168 +1555,48 @@ async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await smart_add(update, ctx)
 
-async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Force-rebuild all Google Sheets tabs and report any chart errors directly to chat."""
+async def refresh_sheets_cmd(update, ctx):
+    """Force-rebuild all Google Sheets tabs immediately."""
     chat_id = str(update.effective_chat.id)
     if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
         await update.message.reply_text(
-            "⚠️ Google Sheets not configured.\nAdd `GOOGLE_SHEETS_CREDS` and `GOOGLE_SHEET_ID` to your environment.",
+            "⚠️ Google Sheets not configured.",
             parse_mode="Markdown"
         )
         return
     msg = await update.message.reply_text("🔄 Refreshing Google Sheets... give me a moment!")
-
     errors = []
-
     def _run():
         _, spreadsheet = _get_gs()
         if not spreadsheet:
             errors.append("Could not connect to Google Sheets.")
             return
-
         month = get_month()
         try:
             _refresh_budget_sheet(spreadsheet, chat_id, month)
         except Exception as e:
             errors.append(f"Budget sheet: {e}")
-
         try:
             _refresh_summary_sheet(spreadsheet, chat_id)
         except Exception as e:
             errors.append(f"Summary sheet: {e}")
-
-        # Dashboard data + formatting (no charts yet)
         try:
             _refresh_dashboard_data(spreadsheet, chat_id)
         except Exception as e:
-            errors.append(f"Dashboard data: {e}")
-
-        # Charts separately so we get granular error info
-        try:
-            budgets = get_budgets(chat_id)
-            _, _, by_cat = calc_summary(chat_id, month)
-            dt = datetime.strptime(month, "%Y-%m")
-            months_list = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
-            months_data = [
-                (datetime.strptime(m, "%Y-%m").strftime("%b %Y"), calc_summary(chat_id, m)[2])
-                for m in months_list
-            ]
-            ws = spreadsheet.worksheet(SHEET_DASHBOARD)
-            _delete_all_charts(spreadsheet, ws.id)
-            _add_charts(spreadsheet, ws, by_cat, budgets, months_data)
-        except Exception as e:
-            import traceback
-            errors.append(f"Charts: {e}\n{traceback.format_exc()[-300:]}")
-
+            errors.append(f"Dashboard: {e}")
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _run)
-
     if errors:
-        err_text = "\n\n".join(f"❌ {e}" for e in errors)
-        await msg.edit_text(
-            f"⚠️ *Sheets refreshed with errors:*\n\n`{err_text[:1000]}`",
-            parse_mode="Markdown"
-        )
+        err_text = "\n".join(f"❌ {e}" for e in errors)
+        await msg.edit_text(f"⚠️ *Sheets refreshed with errors:*\n\n`{err_text[:800]}`", parse_mode="Markdown")
     else:
         await msg.edit_text(
             "✅ *Google Sheets updated!*\n\n"
             "All 4 tabs rebuilt:\n"
-            "• Dashboard (with charts)\n"
-            "• Transactions\n"
-            "• Budget Tracker\n"
-            "• Summary",
+            "• Dashboard\n• Transactions\n• Budget Tracker\n• Summary",
             parse_mode="Markdown"
         )
 
-
-def _refresh_dashboard_data(spreadsheet, chat_id):
-    """Dashboard data + formatting only — no charts. Called separately so chart errors are isolated."""
-    month   = get_month()
-    budgets = get_budgets(chat_id)
-    income, spent, by_cat = calc_summary(chat_id, month)
-    last_month        = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    _, last_spent, _  = calc_summary(chat_id, last_month)
-    total_budget  = sum(budgets.values())
-    remaining     = income - spent
-    savings_rate  = round(remaining / income * 100, 1) if income > 0 else 0
-    budget_pct    = round(spent / total_budget * 100, 1) if total_budget else 0
-    mom_diff      = round(spent - last_spent, 2)
-    mom_arrow     = "▲" if mom_diff > 0 else "▼"
-    updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
-
-    ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
-    # Only clear the visible data area (A:G), preserve scratch cols I+ used by charts
-    ws.batch_clear(["A1:G1000"])
-
-    rows = [
-        [f"Family Budget Dashboard — {month_label(month)}", "", "", "", "", f"Updated: {updated_at}"],
-        [""],
-        ["MONTHLY OVERVIEW", "", "", "", "", ""],
-        ["Income", f"${income:,.2f}", "Spent", f"${spent:,.2f}", "Remaining", f"${remaining:,.2f}"],
-        ["Savings rate", f"{savings_rate}%", "Budget used", f"{budget_pct}%", "vs Last Month", f"{mom_arrow} ${abs(mom_diff):,.2f}"],
-        [""],
-        ["CATEGORY BREAKDOWN", "", "", "", "", ""],
-        ["Category", "Budget", "Spent", "Remaining", "Progress", "Status"],
-    ]
-
-    active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
-    for cat in active_cats:
-        bud    = budgets.get(cat, 0)
-        s      = round(by_cat.get(cat, 0), 2)
-        rem    = round(bud - s, 2) if bud else ""
-        pct    = round(s / bud * 100, 1) if bud else 0
-        bar    = _progress_bar_str(pct) if bud else ""
-        status = _status_text(pct) if bud else "—"
-        rows.append([cat, bud or "", s, rem, bar, status])
-
-    rows += [[""], ["TOP 3 SPENDING CATEGORIES", "", "", "", "", ""]]
-    for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])[:3]:
-        rows.append([cat, f"${amt:,.2f}", "", "", "", ""])
-
-    ws.update("A1", rows, value_input_option="USER_ENTERED")
-
-    fmt_requests = []
-
-    def bold_row(row_idx, bg=None):
-        req = {
-            "repeatCell": {
-                "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
-                           "startColumnIndex": 0, "endColumnIndex": 6},
-                "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 11}}},
-                "fields": "userEnteredFormat.textFormat",
-            }
-        }
-        if bg:
-            req["repeatCell"]["cell"]["userEnteredFormat"]["backgroundColor"] = bg
-            req["repeatCell"]["fields"] += ",userEnteredFormat.backgroundColor"
-        fmt_requests.append(req)
-
-    bold_row(0, _HEADER)
-    fmt_requests.append({"repeatCell": {
-        "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
-                   "startColumnIndex": 0, "endColumnIndex": 6},
-        "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": _WHITE, "bold": True, "fontSize": 12}}},
-        "fields": "userEnteredFormat.textFormat"
-    }})
-    bold_row(2)
-    bold_row(6)
-    bold_row(7, {"red": 0.902, "green": 0.902, "blue": 0.902})
-
-    for i, cat in enumerate(active_cats):
-        bud = budgets.get(cat, 0)
-        s   = by_cat.get(cat, 0)
-        pct = round(s / bud * 100, 1) if bud else 0
-        color = _status_color(pct) if bud else _WHITE
-        fmt_requests.append({"repeatCell": {
-            "range": {"sheetId": ws.id, "startRowIndex": 8 + i, "endRowIndex": 9 + i,
-                       "startColumnIndex": 0, "endColumnIndex": 6},
-            "cell": {"userEnteredFormat": {"backgroundColor": color}},
-            "fields": "userEnteredFormat.backgroundColor",
-        }})
-
-    if fmt_requests:
-        spreadsheet.batch_update({"requests": fmt_requests})
-    _autofit_cols(ws, 6)
 
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤷 Unknown command. Type /help to see all commands.")
