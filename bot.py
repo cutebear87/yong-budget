@@ -181,13 +181,31 @@ def get_all_chats():
 _gs_client = None
 _gs_sheet  = None
 
-SHEET_TX      = "Transactions"
-SHEET_SUMMARY = "Summary"
-SHEET_BUDGET  = "Budget Tracker"
+SHEET_DASHBOARD = "Dashboard"
+SHEET_TX        = "Transactions"
+SHEET_BUDGET    = "Budget Tracker"
+SHEET_SUMMARY   = "Summary"
 
-TX_HEADERS  = ["ID", "Date", "Month", "Type", "Amount", "Category", "Description", "Added By"]
-SUM_HEADERS = ["Month", "Category", "Total Spent", "Budget", "% Used", "Status"]
-BUD_HEADERS = ["Category", "Monthly Budget", "This Month Spent", "Remaining", "% Used", "Status"]
+TX_HEADERS  = ["ID", "Date", "Month", "Type", "Amount (SGD)", "Category", "Description", "Added By", "Running Balance"]
+BUD_HEADERS = ["Category", "Monthly Budget", "Spent This Month", "Remaining", "Progress Bar", "% Used", "Status"]
+SUM_HEADERS = ["Category", "Jan Budget", "Jan Spent", "Jan %", "Feb Budget", "Feb Spent", "Feb %", "Mar Budget", "Mar Spent", "Mar %", "3-Month Avg", "Trend"]
+
+# ── colour helpers ─────────────────────────────────────────────────────────────
+_GREEN  = {"red": 0.851, "green": 0.957, "blue": 0.859}   # #D9F5DB
+_AMBER  = {"red": 0.996, "green": 0.957, "blue": 0.875}   # #FEF4DF
+_RED    = {"red": 0.988, "green": 0.910, "blue": 0.902}   # #FCE8E6
+_HEADER = {"red": 0.235, "green": 0.522, "blue": 0.282}   # #3C8548 dark green
+_WHITE  = {"red": 1.0,   "green": 1.0,   "blue": 1.0}
+
+def _color_cell(bg, bold=False, font_color=None, font_size=10, h_align="LEFT"):
+    fmt = {
+        "backgroundColor": bg,
+        "textFormat": {"bold": bold, "fontSize": font_size},
+        "horizontalAlignment": h_align,
+    }
+    if font_color:
+        fmt["textFormat"]["foregroundColor"] = font_color
+    return fmt
 
 def _get_gs():
     global _gs_client, _gs_sheet
@@ -213,42 +231,164 @@ def _get_gs():
         _gs_client = _gs_sheet = None
     return _gs_client, _gs_sheet
 
-def _get_or_create_ws(spreadsheet, title, headers):
+def _get_or_create_ws(spreadsheet, title, headers, cols=None):
     try:
         ws = spreadsheet.worksheet(title)
     except Exception:
-        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=len(headers))
+        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=cols or len(headers))
         ws.append_row(headers, value_input_option="USER_ENTERED")
-        _fmt_header(ws)
+        _fmt_header_row(ws, len(headers))
     return ws
 
-def _fmt_header(ws):
+def _fmt_header_row(ws, num_cols):
+    """Bold, freeze, and colour the header row dark green with white text."""
     try:
-        ws.format("1:1", {"textFormat": {"bold": True}})
+        col_letter = chr(ord('A') + num_cols - 1)
+        ws.format(f"A1:{col_letter}1", {
+            "backgroundColor": _HEADER,
+            "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 10},
+            "horizontalAlignment": "CENTER",
+        })
         ws.freeze(rows=1)
     except Exception:
         pass
 
+def _fmt_col_currency(ws, col_letter, start_row, end_row):
+    """Apply SGD currency format to a column range."""
+    try:
+        ws.format(f"{col_letter}{start_row}:{col_letter}{end_row}", {
+            "numberFormat": {"type": "CURRENCY", "pattern": '"$"#,##0.00'}
+        })
+    except Exception:
+        pass
+
+def _fmt_col_pct(ws, col_letter, start_row, end_row):
+    try:
+        ws.format(f"{col_letter}{start_row}:{col_letter}{end_row}", {
+            "numberFormat": {"type": "NUMBER", "pattern": "0.0\"%\""}
+        })
+    except Exception:
+        pass
+
+def _autofit_cols(ws, num_cols):
+    """Auto-resize all columns to fit content."""
+    try:
+        body = {
+            "requests": [{
+                "autoResizeDimensions": {
+                    "dimensions": {
+                        "sheetId": ws.id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 0,
+                        "endIndex": num_cols,
+                    }
+                }
+            }]
+        }
+        ws.spreadsheet.batch_update(body)
+    except Exception:
+        pass
+
+def _apply_banding(ws, num_cols, num_rows):
+    """Apply alternating row colours (banding) to the data range."""
+    try:
+        col_letter = chr(ord('A') + num_cols - 1)
+        ws.spreadsheet.batch_update({"requests": [{
+            "addBanding": {
+                "bandedRange": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": num_rows + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols,
+                    },
+                    "rowProperties": {
+                        "headerColor":     _HEADER,
+                        "firstBandColor":  _WHITE,
+                        "secondBandColor": {"red": 0.973, "green": 0.984, "blue": 0.973},
+                    }
+                }
+            }
+        }]})
+    except Exception:
+        pass
+
+def _add_filter(ws, num_cols):
+    """Enable auto-filter on the header row."""
+    try:
+        ws.spreadsheet.batch_update({"requests": [{
+            "setBasicFilter": {
+                "filter": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols,
+                    }
+                }
+            }
+        }]})
+    except Exception:
+        pass
+
+def _status_color(pct):
+    if pct >= 100: return _RED
+    if pct >= 80:  return _AMBER
+    return _GREEN
+
+def _status_text(pct):
+    if pct >= 100: return "Over budget"
+    if pct >= 80:  return "Warning"
+    return "OK"
+
+def _progress_bar_str(pct, width=10):
+    filled = max(0, min(round(pct / 100 * width), width))
+    return "█" * filled + "░" * (width - filled)
+
 def _ensure_sheets(spreadsheet):
-    _get_or_create_ws(spreadsheet, SHEET_TX,      TX_HEADERS)
-    _get_or_create_ws(spreadsheet, SHEET_SUMMARY,  SUM_HEADERS)
-    _get_or_create_ws(spreadsheet, SHEET_BUDGET,   BUD_HEADERS)
+    _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=10)
+    _get_or_create_ws(spreadsheet, SHEET_TX,        TX_HEADERS)
+    _get_or_create_ws(spreadsheet, SHEET_BUDGET,    BUD_HEADERS)
+    _get_or_create_ws(spreadsheet, SHEET_SUMMARY,   SUM_HEADERS)
     try:
         default = spreadsheet.worksheet("Sheet1")
         spreadsheet.del_worksheet(default)
     except Exception:
         pass
 
+# ── Transactions sheet ────────────────────────────────────────────────────────
 def gs_append_tx(tx_id, date, month, type_, amount, cat, desc, added_by):
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
     try:
         ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        all_vals = ws.get_all_values()
+        next_row = len(all_vals) + 1
+
+        sign = 1 if type_ == "income" else -1
+        if next_row == 2:
+            running_bal_formula = f"=E2"
+        else:
+            running_bal_formula = f"=I{next_row - 1}+IF(D{next_row}=\"income\",E{next_row},-E{next_row})"
+
         ws.append_row(
-            [str(tx_id), date, month, type_, amount, cat, desc, added_by],
+            [str(tx_id), date, month, type_, amount, cat, desc, added_by, running_bal_formula],
             value_input_option="USER_ENTERED"
         )
+        _fmt_col_currency(ws, "E", next_row, next_row)
+        _fmt_col_currency(ws, "I", next_row, next_row)
+
+        income_color = {"red": 0.851, "green": 0.957, "blue": 0.859}
+        expense_color = {"red": 0.988, "green": 0.910, "blue": 0.902}
+        ws.format(f"D{next_row}", {
+            "backgroundColor": income_color if type_ == "income" else expense_color,
+            "textFormat": {"bold": True, "fontSize": 10},
+            "horizontalAlignment": "CENTER",
+        })
+        _autofit_cols(ws, len(TX_HEADERS))
     except Exception as e:
         print(f"gs_append_tx error: {e}")
 
@@ -269,64 +409,283 @@ def gs_update_tx_category(tx_id, new_category):
     if not spreadsheet:
         return
     try:
-        ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        ws   = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
         cell = ws.find(str(tx_id), in_column=1)
         if cell:
             ws.update_cell(cell.row, 6, new_category)
     except Exception as e:
         print(f"gs_update_tx_category error: {e}")
 
+# ── Budget Tracker sheet ──────────────────────────────────────────────────────
+def _refresh_budget_sheet(spreadsheet, chat_id, month):
+    budgets     = get_budgets(chat_id)
+    _, _, by_cat = calc_summary(chat_id, month)
+
+    ws = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
+    ws.clear()
+    ws.append_row(BUD_HEADERS, value_input_option="USER_ENTERED")
+    _fmt_header_row(ws, len(BUD_HEADERS))
+
+    bud_rows  = []
+    row_colors = []
+
+    for cat in CATS:
+        spent = by_cat.get(cat, 0)
+        bud   = budgets.get(cat, 0)
+        if not spent and not bud:
+            continue
+        remaining = round(bud - spent, 2) if bud else ""
+        pct       = round(spent / bud * 100, 1) if bud else 0
+        bar       = _progress_bar_str(pct) if bud else ""
+        status    = _status_text(pct) if bud else "No budget set"
+        bud_rows.append([cat, bud or "", round(spent, 2), remaining, bar, pct if bud else "", status])
+        row_colors.append(_status_color(pct) if bud else _WHITE)
+
+    if not bud_rows:
+        return
+
+    total_bud   = sum(budgets.get(c, 0) for c in CATS)
+    total_spent = sum(by_cat.get(c, 0) for c in CATS if budgets.get(c, 0))
+    total_rem   = round(total_bud - total_spent, 2)
+    total_pct   = round(total_spent / total_bud * 100, 1) if total_bud else 0
+    bud_rows.append(["TOTAL", total_bud, round(total_spent, 2), total_rem, _progress_bar_str(total_pct), total_pct, _status_text(total_pct)])
+    row_colors.append(_WHITE)
+
+    ws.append_rows(bud_rows, value_input_option="USER_ENTERED")
+
+    data_end = len(bud_rows) + 1
+    _fmt_col_currency(ws, "B", 2, data_end)
+    _fmt_col_currency(ws, "C", 2, data_end)
+    _fmt_col_currency(ws, "D", 2, data_end)
+    _fmt_col_pct(ws, "F", 2, data_end)
+
+    requests = []
+    for i, color in enumerate(row_colors):
+        row_idx = i + 1
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex": row_idx + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(BUD_HEADERS),
+                },
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    if row_colors:
+        last_row_idx = len(row_colors)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": ws.id,
+                    "startRowIndex": last_row_idx,
+                    "endRowIndex": last_row_idx + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": len(BUD_HEADERS),
+                },
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 0.902, "green": 0.902, "blue": 0.902},
+                    "textFormat": {"bold": True},
+                }},
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold",
+            }
+        })
+
+    if requests:
+        spreadsheet.batch_update({"requests": requests})
+
+    _add_filter(ws, len(BUD_HEADERS))
+    _autofit_cols(ws, len(BUD_HEADERS))
+
+# ── Summary sheet ─────────────────────────────────────────────────────────────
+def _refresh_summary_sheet(spreadsheet, chat_id):
+    month    = get_month()
+    budgets  = get_budgets(chat_id)
+    dt       = datetime.strptime(month, "%Y-%m")
+    months   = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
+
+    ws = _get_or_create_ws(spreadsheet, SHEET_SUMMARY, SUM_HEADERS)
+    ws.clear()
+
+    month_labels = [datetime.strptime(m, "%Y-%m").strftime("%b %Y") for m in months]
+    headers = ["Category"]
+    for lbl in month_labels:
+        headers += [f"{lbl} Budget", f"{lbl} Spent", f"{lbl} %"]
+    headers += ["3-Month Avg", "Trend"]
+    ws.append_row(headers, value_input_option="USER_ENTERED")
+    _fmt_header_row(ws, len(headers))
+
+    by_cat_per_month = [calc_summary(chat_id, m)[2] for m in months]
+    sum_rows   = []
+    row_colors = []
+
+    for cat in CATS:
+        row   = [cat]
+        spends = []
+        for i, m in enumerate(months):
+            bud   = budgets.get(cat, 0)
+            spent = round(by_cat_per_month[i].get(cat, 0), 2)
+            pct   = round(spent / bud * 100, 1) if bud else ""
+            row  += [bud or "", spent, pct]
+            spends.append(spent)
+        avg = round(sum(spends) / len(spends), 2) if any(spends) else 0
+        if spends[0] == 0 and spends[-1] == 0:
+            trend = "—"
+        elif spends[-1] > spends[0]:
+            trend = "▲ Increasing"
+        elif spends[-1] < spends[0]:
+            trend = "▼ Decreasing"
+        else:
+            trend = "→ Stable"
+        row += [avg, trend]
+        if any(spends) or budgets.get(cat, 0):
+            latest_pct = round(spends[-1] / budgets[cat] * 100, 1) if budgets.get(cat, 0) else 0
+            sum_rows.append(row)
+            row_colors.append(_status_color(latest_pct) if budgets.get(cat, 0) else _WHITE)
+
+    if sum_rows:
+        ws.append_rows(sum_rows, value_input_option="USER_ENTERED")
+        data_end = len(sum_rows) + 1
+        for col in ["B", "C", "E", "F", "H", "I", "K"]:
+            _fmt_col_currency(ws, col, 2, data_end)
+        for col in ["D", "G", "J"]:
+            _fmt_col_pct(ws, col, 2, data_end)
+
+        requests = []
+        for i, color in enumerate(row_colors):
+            row_idx = i + 1
+            requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": row_idx,
+                        "endRowIndex": row_idx + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": len(headers),
+                    },
+                    "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            })
+        if requests:
+            spreadsheet.batch_update({"requests": requests})
+
+    _add_filter(ws, len(headers))
+    _autofit_cols(ws, len(headers))
+
+# ── Dashboard sheet ───────────────────────────────────────────────────────────
+def _refresh_dashboard(spreadsheet, chat_id):
+    month   = get_month()
+    budgets = get_budgets(chat_id)
+    income, spent, by_cat = calc_summary(chat_id, month)
+
+    last_month        = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    _, last_spent, _  = calc_summary(chat_id, last_month)
+
+    total_budget  = sum(budgets.values())
+    remaining     = income - spent
+    savings_rate  = round(remaining / income * 100, 1) if income > 0 else 0
+    budget_pct    = round(spent / total_budget * 100, 1) if total_budget else 0
+    mom_diff      = round(spent - last_spent, 2)
+    mom_arrow     = "▲" if mom_diff > 0 else "▼"
+    updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
+
+    try:
+        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=6)
+        ws.clear()
+
+        rows = [
+            [f"Family Budget Dashboard — {month_label(month)}", "", "", "", "", f"Updated: {updated_at}"],
+            [""],
+            ["MONTHLY OVERVIEW", "", "", "", "", ""],
+            ["Income", f"${income:,.2f}", "Spent", f"${spent:,.2f}", "Remaining", f"${remaining:,.2f}"],
+            ["Savings rate", f"{savings_rate}%", "Budget used", f"{budget_pct}%", "vs Last Month", f"{mom_arrow} ${abs(mom_diff):,.2f}"],
+            [""],
+            ["CATEGORY BREAKDOWN", "", "", "", "", ""],
+            ["Category", "Budget", "Spent", "Remaining", "Progress", "Status"],
+        ]
+
+        for cat in CATS:
+            bud   = budgets.get(cat, 0)
+            s     = round(by_cat.get(cat, 0), 2)
+            rem   = round(bud - s, 2) if bud else ""
+            pct   = round(s / bud * 100, 1) if bud else 0
+            bar   = _progress_bar_str(pct) if bud else ""
+            status = _status_text(pct) if bud else "—"
+            if s or bud:
+                rows.append([cat, bud or "", s, rem, bar, status])
+
+        rows += [
+            [""],
+            ["TOP 3 SPENDING CATEGORIES", "", "", "", "", ""],
+        ]
+        top3 = sorted(by_cat.items(), key=lambda x: -x[1])[:3]
+        for cat, amt in top3:
+            rows.append([cat, f"${amt:,.2f}", "", "", "", ""])
+
+        ws.update("A1", rows, value_input_option="USER_ENTERED")
+
+        requests = []
+
+        def bold_row(row_idx, bg=None):
+            req = {
+                "repeatCell": {
+                    "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
+                               "startColumnIndex": 0, "endColumnIndex": 6},
+                    "cell": {"userEnteredFormat": {"textFormat": {"bold": True, "fontSize": 11}}},
+                    "fields": "userEnteredFormat.textFormat",
+                }
+            }
+            if bg:
+                req["repeatCell"]["cell"]["userEnteredFormat"]["backgroundColor"] = bg
+                req["repeatCell"]["fields"] += ",userEnteredFormat.backgroundColor"
+            requests.append(req)
+
+        bold_row(0, _HEADER)
+        requests.append({"repeatCell": {"range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
+                                                    "startColumnIndex": 0, "endColumnIndex": 6},
+                          "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": _WHITE, "bold": True, "fontSize": 12}}},
+                          "fields": "userEnteredFormat.textFormat"}})
+        bold_row(2)
+        bold_row(6)
+        bold_row(7, {"red": 0.902, "green": 0.902, "blue": 0.902})
+
+        for i, cat in enumerate(CATS):
+            bud = budgets.get(cat, 0)
+            s   = by_cat.get(cat, 0)
+            if not s and not bud:
+                continue
+            pct = round(s / bud * 100, 1) if bud else 0
+            color = _status_color(pct) if bud else _WHITE
+            row_idx = 8 + [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)].index(cat)
+            requests.append({"repeatCell": {
+                "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
+                           "startColumnIndex": 0, "endColumnIndex": 6},
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }})
+
+        if requests:
+            spreadsheet.batch_update({"requests": requests})
+
+        _autofit_cols(ws, 6)
+    except Exception as e:
+        print(f"_refresh_dashboard error: {e}")
+
+# ── Master refresh ────────────────────────────────────────────────────────────
 def gs_refresh_summary(chat_id):
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
     try:
-        month   = get_month()
-        budgets = get_budgets(chat_id)
-
-        ws_sum = _get_or_create_ws(spreadsheet, SHEET_SUMMARY, SUM_HEADERS)
-        ws_sum.clear()
-        ws_sum.append_row(SUM_HEADERS, value_input_option="USER_ENTERED")
-        _fmt_header(ws_sum)
-
-        months_to_show = []
-        dt = datetime.strptime(month, "%Y-%m")
-        for i in range(3):
-            months_to_show.append((dt - timedelta(days=30*i)).strftime("%Y-%m"))
-
-        sum_rows = []
-        for m in months_to_show:
-            _, _, by_cat = calc_summary(chat_id, m)
-            for cat in CATS:
-                spent = by_cat.get(cat, 0)
-                bud   = budgets.get(cat, 0)
-                if not spent and not bud:
-                    continue
-                pct    = round(spent / bud * 100, 1) if bud else ""
-                status = ("🔴 Over" if spent > bud else "🟡 Warning" if bud and spent/bud >= 0.8 else "🟢 OK") if bud else "—"
-                sum_rows.append([m, cat, spent, bud if bud else "", pct, status])
-        if sum_rows:
-            ws_sum.append_rows(sum_rows, value_input_option="USER_ENTERED")
-
-        ws_bud = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
-        ws_bud.clear()
-        ws_bud.append_row(BUD_HEADERS, value_input_option="USER_ENTERED")
-        _fmt_header(ws_bud)
-
-        _, _, by_cat_now = calc_summary(chat_id, month)
-        bud_rows = []
-        for cat in CATS:
-            spent = by_cat_now.get(cat, 0)
-            bud   = budgets.get(cat, 0)
-            if not spent and not bud:
-                continue
-            remaining = (bud - spent) if bud else ""
-            pct       = round(spent / bud * 100, 1) if bud else ""
-            status    = ("🔴 Over" if spent > bud else "🟡 Warning" if bud and spent/bud >= 0.8 else "🟢 OK") if bud else "—"
-            bud_rows.append([cat, bud if bud else "", spent, remaining, pct, status])
-        if bud_rows:
-            ws_bud.append_rows(bud_rows, value_input_option="USER_ENTERED")
-
+        month = get_month()
+        _refresh_budget_sheet(spreadsheet, chat_id, month)
+        _refresh_summary_sheet(spreadsheet, chat_id)
+        _refresh_dashboard(spreadsheet, chat_id)
     except Exception as e:
         print(f"gs_refresh_summary error: {e}")
 
