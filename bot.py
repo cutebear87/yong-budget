@@ -1,6 +1,8 @@
 import os
 import sqlite3
 from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -11,6 +13,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import re
 import base64
 import httpx
+import asyncio
+import json
 
 TOKEN        = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -19,26 +23,37 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS", "")   # service account JSON string
 GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")       # spreadsheet ID from URL
 
-CATS = [
-    "Housing/Rent", "Groceries", "Dining Out", "Subscriptions",
-    "Transportation", "Utilities", "Entertainment", "Savings", "Personal/Shopping"
+# ── CATEGORY DEFINITIONS ──────────────────────────────────────────────────────
+@dataclass
+class Category:
+    name: str
+    icon: str
+    keywords: List[str] = field(default_factory=list)
+
+CATEGORIES = [
+    Category("Housing/Rent",      "🏠", ["rent", "mortgage", "condo", "hdb", "housing", "property"]),
+    Category("Groceries",         "🛒", ["grocery", "groceries", "supermarket", "market", "fairprice", "ntuc",
+                                          "cold storage", "giant", "trader", "walmart", "costco",
+                                          "food", "lunch", "dinner", "breakfast", "meal", "supper"]),
+    Category("Dining Out",        "🍽", ["dining", "restaurant", "cafe", "coffee", "starbucks", "mcdonald",
+                                          "burger", "pizza", "sushi", "hawker", "kopitiam", "grab food",
+                                          "deliveroo", "foodpanda", "nobu", "brunch"]),
+    Category("Subscriptions",     "📱", ["netflix", "spotify", "apple", "google", "subscription", "sub",
+                                          "amazon prime", "youtube", "disney", "hulu"]),
+    Category("Transportation",    "🚗", ["grab", "taxi", "uber", "mrt", "bus", "transport", "petrol",
+                                          "gas", "parking", "ez-link", "train", "gojek", "car"]),
+    Category("Utilities",         "⚡", ["electric", "water", "internet", "phone", "bill", "utility",
+                                          "telco", "singtel", "starhub", "m1"]),
+    Category("Entertainment",     "🎬", ["movie", "cinema", "concert", "game", "shopping", "mall", "entertainment"]),
+    Category("Savings",           "💰", ["savings", "save", "investment", "invest", "cpf"]),
+    Category("Personal/Shopping", "🛍", ["shopping", "clothes", "shoes", "haircut", "gym", "beauty",
+                                          "personal", "lazada", "shopee", "amazon"]),
 ]
-CAT_ICONS = {
-    "Housing/Rent":"🏠","Groceries":"🛒","Dining Out":"🍽",
-    "Subscriptions":"📱","Transportation":"🚗","Utilities":"⚡",
-    "Entertainment":"🎬","Savings":"💰","Personal/Shopping":"🛍","Income":"💵"
-}
-CAT_KEYWORDS = {
-    "Groceries": ["grocery","groceries","supermarket","market","fairprice","ntuc","cold storage","giant","trader","walmart","costco","food","lunch","dinner","breakfast","meal","supper"],
-    "Dining Out": ["dining","restaurant","cafe","coffee","starbucks","mcdonald","burger","pizza","sushi","hawker","kopitiam","grab food","deliveroo","foodpanda","nobu","brunch"],
-    "Transportation": ["grab","taxi","uber","mrt","bus","transport","petrol","gas","parking","ez-link","train","gojek","car"],
-    "Subscriptions": ["netflix","spotify","apple","google","subscription","sub","amazon prime","youtube","disney","hulu"],
-    "Entertainment": ["movie","cinema","concert","game","shopping","mall","entertainment"],
-    "Utilities": ["electric","water","internet","phone","bill","utility","telco","singtel","starhub","m1"],
-    "Housing/Rent": ["rent","mortgage","condo","hdb","housing","property"],
-    "Savings": ["savings","save","investment","invest","cpf"],
-    "Personal/Shopping": ["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon"],
-}
+
+# Derived lookups — the rest of the code uses these unchanged
+CATS         = [c.name for c in CATEGORIES]
+CAT_ICONS    = {c.name: c.icon for c in CATEGORIES} | {"Income": "💵"}
+CAT_KEYWORDS = {c.name: c.keywords for c in CATEGORIES}
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 def get_conn():
@@ -82,7 +97,6 @@ def add_tx(chat_id, type_, amount, desc, cat, date, added_by):
     cur = conn.cursor()
     cur.execute(f"INSERT INTO transactions (id,chat_id,type,amount,description,category,date,added_by,month) VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})", (tx_id,chat_id,type_,amount,desc,cat,date,added_by,month))
     conn.commit(); conn.close()
-    # Return full tuple so callers can fire the sheets sync
     return tx_id, date, month, type_, amount, cat, desc, added_by
 
 def del_tx(tx_id, chat_id):
@@ -147,7 +161,6 @@ def del_recurring(r_id, chat_id):
     conn.commit(); conn.close()
 
 def get_txs_by_date(chat_id, date_str):
-    """Fetch all transactions for a specific date (YYYY-MM-DD)."""
     conn, db_type = get_conn(); p = ph(db_type)
     cur = conn.cursor()
     cur.execute(
@@ -165,8 +178,8 @@ def get_all_chats():
     return [r[0] for r in rows]
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
-_gs_client = None   # gspread client (lazy init)
-_gs_sheet  = None   # spreadsheet object (lazy init)
+_gs_client = None
+_gs_sheet  = None
 
 SHEET_TX      = "Transactions"
 SHEET_SUMMARY = "Summary"
@@ -177,14 +190,13 @@ SUM_HEADERS = ["Month", "Category", "Total Spent", "Budget", "% Used", "Status"]
 BUD_HEADERS = ["Category", "Monthly Budget", "This Month Spent", "Remaining", "% Used", "Status"]
 
 def _get_gs():
-    """Return (client, spreadsheet) — lazy-initialise once per process."""
     global _gs_client, _gs_sheet
     if _gs_sheet is not None:
         return _gs_client, _gs_sheet
     if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
         return None, None
     try:
-        import gspread, json
+        import gspread
         from google.oauth2.service_account import Credentials
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -202,7 +214,6 @@ def _get_gs():
     return _gs_client, _gs_sheet
 
 def _get_or_create_ws(spreadsheet, title, headers):
-    """Return worksheet by title, creating it with headers if missing."""
     try:
         ws = spreadsheet.worksheet(title)
     except Exception:
@@ -212,7 +223,6 @@ def _get_or_create_ws(spreadsheet, title, headers):
     return ws
 
 def _fmt_header(ws):
-    """Bold + freeze the header row."""
     try:
         ws.format("1:1", {"textFormat": {"bold": True}})
         ws.freeze(rows=1)
@@ -220,11 +230,9 @@ def _fmt_header(ws):
         pass
 
 def _ensure_sheets(spreadsheet):
-    """Make sure all three worksheets exist with headers."""
     _get_or_create_ws(spreadsheet, SHEET_TX,      TX_HEADERS)
     _get_or_create_ws(spreadsheet, SHEET_SUMMARY,  SUM_HEADERS)
     _get_or_create_ws(spreadsheet, SHEET_BUDGET,   BUD_HEADERS)
-    # Remove the default 'Sheet1' if it still exists
     try:
         default = spreadsheet.worksheet("Sheet1")
         spreadsheet.del_worksheet(default)
@@ -232,7 +240,6 @@ def _ensure_sheets(spreadsheet):
         pass
 
 def gs_append_tx(tx_id, date, month, type_, amount, cat, desc, added_by):
-    """Append one row to the Transactions sheet."""
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
@@ -246,7 +253,6 @@ def gs_append_tx(tx_id, date, month, type_, amount, cat, desc, added_by):
         print(f"gs_append_tx error: {e}")
 
 def gs_delete_tx(tx_id):
-    """Find and delete the row with matching transaction ID."""
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
@@ -259,7 +265,6 @@ def gs_delete_tx(tx_id):
         print(f"gs_delete_tx error: {e}")
 
 def gs_update_tx_category(tx_id, new_category):
-    """Update the Category cell for a matching transaction ID row."""
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
@@ -267,13 +272,11 @@ def gs_update_tx_category(tx_id, new_category):
         ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
         cell = ws.find(str(tx_id), in_column=1)
         if cell:
-            # TX_HEADERS: ["ID", "Date", "Month", "Type", "Amount", "Category", "Description", "Added By"]
             ws.update_cell(cell.row, 6, new_category)
     except Exception as e:
         print(f"gs_update_tx_category error: {e}")
 
 def gs_refresh_summary(chat_id):
-    """Rewrite the Summary and Budget Tracker sheets from current DB state."""
     _, spreadsheet = _get_gs()
     if not spreadsheet:
         return
@@ -281,7 +284,6 @@ def gs_refresh_summary(chat_id):
         month   = get_month()
         budgets = get_budgets(chat_id)
 
-        # ── Summary tab: last 3 months × all categories ───────────────────
         ws_sum = _get_or_create_ws(spreadsheet, SHEET_SUMMARY, SUM_HEADERS)
         ws_sum.clear()
         ws_sum.append_row(SUM_HEADERS, value_input_option="USER_ENTERED")
@@ -306,7 +308,6 @@ def gs_refresh_summary(chat_id):
         if sum_rows:
             ws_sum.append_rows(sum_rows, value_input_option="USER_ENTERED")
 
-        # ── Budget Tracker tab: current month ─────────────────────────────
         ws_bud = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
         ws_bud.clear()
         ws_bud.append_row(BUD_HEADERS, value_input_option="USER_ENTERED")
@@ -332,11 +333,6 @@ def gs_refresh_summary(chat_id):
 async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
                         type_=None, amount=None, cat=None, desc=None,
                         added_by=None, delete=False, update_category=False):
-    """
-    Non-blocking wrapper — runs the sync in a thread so it never delays
-    Telegram responses.  Call with asyncio.create_task().
-    """
-    import asyncio
     loop = asyncio.get_event_loop()
     if delete and tx_id:
         await loop.run_in_executor(None, gs_delete_tx, tx_id)
@@ -346,7 +342,6 @@ async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
         await loop.run_in_executor(None, gs_append_tx,
                                    tx_id, date, month, type_,
                                    amount, cat, desc, added_by)
-    # Always refresh summary/budget tabs
     await loop.run_in_executor(None, gs_refresh_summary, chat_id)
 
 
@@ -378,9 +373,9 @@ def budget_status(pct):
 def guess_category(text):
     """Guess category from description keywords."""
     text_lower = text.lower()
-    for cat, keywords in CAT_KEYWORDS.items():
-        if any(kw in text_lower for kw in keywords):
-            return cat
+    for cat_obj in CATEGORIES:
+        if any(kw in text_lower for kw in cat_obj.keywords):
+            return cat_obj.name
     return None
 
 def get_grade(pct_used):
@@ -402,13 +397,11 @@ def main_keyboard():
 
 # ── RECEIPT SCANNER ──────────────────────────────────────────────────────────
 async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
-    """Send receipt image to Claude API and extract transaction details."""
     if not ANTHROPIC_API_KEY:
         return {"error": "ANTHROPIC_API_KEY not configured"}
 
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-    # Detect media type from magic bytes
     if image_bytes[:4] == b'\x89PNG':
         media_type = "image/png"
     elif image_bytes[:2] == b'\xff\xd8':
@@ -416,8 +409,11 @@ async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
     elif image_bytes[:4] == b'RIFF':
         media_type = "image/webp"
     else:
-        media_type = "image/jpeg"  # default
+        media_type = "image/jpeg"
     print(f"Detected media type: {media_type}, size: {len(image_bytes)}")
+
+    # Build valid category list dynamically from CATEGORIES
+    valid_categories = ", ".join(c.name for c in CATEGORIES)
 
     payload = {
         "model": "claude-sonnet-4-6",
@@ -436,19 +432,19 @@ async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
                     },
                     {
                         "type": "text",
-                        "text": """Analyze this receipt image and extract the following information.
+                        "text": f"""Analyze this receipt image and extract the following information.
 Reply ONLY with a JSON object, no other text:
-{
+{{
   "merchant": "store/restaurant name",
   "total": 12.34,
   "date": "YYYY-MM-DD or null if not visible",
-  "category": "one of: Groceries, Dining Out, Transportation, Entertainment, Subscriptions, Utilities, Housing/Rent, Savings, Personal/Shopping",
+  "category": "one of: {valid_categories}",
   "items": ["item1 $x.xx", "item2 $x.xx"],
   "confidence": "high/medium/low"
-}
+}}
 
 If you cannot read the receipt clearly, return:
-{"error": "Cannot read receipt clearly"}"""
+{{"error": "Cannot read receipt clearly"}}"""
                     }
                 ],
             }
@@ -470,13 +466,10 @@ If you cannot read the receipt clearly, return:
             return {"error": f"API error {response.status_code}: {response.text[:200]}"}
         data = response.json()
         text = data["content"][0]["text"].strip()
-        # Clean up any markdown code blocks
         text = text.replace("```json", "").replace("```", "").strip()
-        import json
         return json.loads(text)
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle photo messages — scan as receipt."""
     chat_id = str(update.effective_chat.id)
     added_by = update.effective_user.first_name or "Someone"
 
@@ -487,15 +480,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Send scanning message
     scanning_msg = await update.message.reply_text("📸 Scanning receipt... give me a sec! ⏳")
 
     try:
-        # Get the largest photo
         photo = update.message.photo[-1]
         photo_file = await ctx.bot.get_file(photo.file_id)
-
-       # Download using Telegram's built-in downloader
         image_bytes = await photo_file.download_as_bytearray()
         image_bytes = bytes(image_bytes)
 
@@ -503,7 +492,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         if len(image_bytes) < 1000:
             raise Exception(f"Downloaded image too small ({len(image_bytes)} bytes)")
-        # Send to Claude
+
         result = await scan_receipt_with_claude(image_bytes)
 
         if "error" in result:
@@ -527,29 +516,25 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Log the transaction
         tx_info = add_tx(chat_id, "expense", total, merchant, category, date, added_by)
-        import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         tx_id = tx_info[0]
 
         icon = CAT_ICONS.get(category, "•")
         conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
 
-        # Build items text
         items_text = ""
         if items:
             items_text = "\n" + "\n".join(f"  • {item}" for item in items[:5])
             if len(items) > 5:
                 items_text += f"\n  _...and {len(items)-5} more_"
 
-        # Category change keyboard
         keyboard = []
         row = []
-        for i, cat in enumerate(CATS):
-            icon2 = CAT_ICONS.get(cat, "•")
+        for i, cat_obj in enumerate(CATEGORIES):
             row.append(InlineKeyboardButton(
-                f"{icon2} {cat.split('/')[0]}",
-                callback_data=f"quickcat_{tx_id}_{cat}"
+                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
+                callback_data=f"quickcat_{tx_id}_{cat_obj.name}"
             ))
             if len(row) == 2:
                 keyboard.append(row); row = []
@@ -567,7 +552,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-        # Check budget alert
         await check_budget_alert(update, ctx, chat_id, category)
 
     except Exception as e:
@@ -577,11 +561,9 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-# ── SMART QUICK-ADD (just type amount + description) ─────────────────────────
+# ── SMART QUICK-ADD ───────────────────────────────────────────────────────────
 async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handles messages like '45.50 dinner at nobu' without /add prefix."""
     text = update.message.text.strip()
-    # Match: number followed by text
     match = re.match(r'^(\d+\.?\d*)\s+(.+)$', text)
     if not match:
         return
@@ -595,19 +577,20 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     guessed_cat = guess_category(desc)
 
     if guessed_cat:
-        # Auto-log with guessed category
         date = datetime.now().strftime("%Y-%m-%d")
         added_by = update.effective_user.first_name or "Someone"
         tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
-        import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         tx_id = tx_info[0]
         icon = CAT_ICONS.get(guessed_cat, "•")
-        # Build category picker in case they want to change
+
         keyboard = []
         row = []
-        for i, cat in enumerate(CATS):
-            icon2 = CAT_ICONS.get(cat, "•")
-            row.append(InlineKeyboardButton(f"{icon2} {cat.split('/')[0]}", callback_data=f"quickcat_{tx_id}_{cat}"))
+        for i, cat_obj in enumerate(CATEGORIES):
+            row.append(InlineKeyboardButton(
+                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
+                callback_data=f"quickcat_{tx_id}_{cat_obj.name}"
+            ))
             if len(row) == 2:
                 keyboard.append(row); row = []
         if row: keyboard.append(row)
@@ -619,12 +602,13 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await check_budget_alert(update, ctx, chat_id, guessed_cat)
     else:
-        # Show category picker
         keyboard = []
         row = []
-        for i, cat in enumerate(CATS):
-            icon = CAT_ICONS.get(cat, "•")
-            row.append(InlineKeyboardButton(f"{icon} {cat.split('/')[0]}", callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"))
+        for i, cat_obj in enumerate(CATEGORIES):
+            row.append(InlineKeyboardButton(
+                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
+                callback_data=f"quickcat_{amount}_{desc[:20]}_{cat_obj.name}"
+            ))
             if len(row) == 2:
                 keyboard.append(row); row = []
         if row: keyboard.append(row)
@@ -638,8 +622,6 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     chat_id = str(update.effective_chat.id)
     parts = query.data.replace("quickcat_","").split("_")
-    # Preferred format: quickcat_<tx_id>_<category>
-    # Legacy format (kept for compatibility): quickcat_<amount>_<desc>_<category>
     updated_cat = "_".join(parts[1:]) if parts else ""
     try:
         maybe_id = int(parts[0])
@@ -652,7 +634,7 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ Couldn't find that transaction anymore.", parse_mode="Markdown")
             return
         update_tx_category(maybe_id, chat_id, updated_cat)
-        import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
+        asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
         icon = CAT_ICONS.get(updated_cat, "•")
         amount = tx[3]
         desc = tx[4]
@@ -668,17 +650,16 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     amount = float(parts[0])
     desc = parts[1]
     cat = "_".join(parts[2:])
-    # Delete the most recent transaction with same amount to avoid duplicates
     txs = get_txs(chat_id)
     for t in txs:
         if t[3] == amount and t[4] == desc:
             del_tx(t[0], chat_id)
-            import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
+            asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
             break
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
     tx_info = add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
-    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     icon = CAT_ICONS.get(cat,"•")
     await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}", parse_mode="Markdown")
     await check_budget_alert_query(query, ctx, chat_id, cat)
@@ -690,7 +671,7 @@ async def check_budget_alert(update, ctx, chat_id, cat):
     _, _, by_cat = calc_summary(chat_id)
     spent = by_cat.get(cat, 0)
     pct = spent / bud
-    if 0.8 <= pct < 0.82:  # Only alert once around 80%
+    if 0.8 <= pct < 0.82:
         icon = CAT_ICONS.get(cat,"•")
         await update.message.reply_text(
             f"⚠️ *Budget Alert!*\n\n{icon} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",
@@ -785,7 +766,7 @@ async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
     tx_info = add_tx(chat_id, "expense", amount, desc, matched_cat, date, added_by)
-    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     icon = CAT_ICONS.get(matched_cat, "•")
     budgets = get_budgets(chat_id)
     _, spent, by_cat = calc_summary(chat_id)
@@ -815,7 +796,7 @@ async def add_income(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     date = datetime.now().strftime("%Y-%m-%d")
     added_by = update.effective_user.first_name or "Someone"
     tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
-    import asyncio; asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
     await update.message.reply_text(
         f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",
         parse_mode="Markdown")
@@ -851,14 +832,12 @@ async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def report_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Monthly report card with grade."""
     chat_id = str(update.effective_chat.id)
     month = get_month()
     income, spent, by_cat = calc_summary(chat_id, month)
     budgets = get_budgets(chat_id)
     total_budget = sum(budgets.values())
 
-    # Compare to last month
     last_month = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     _, last_spent, last_by_cat = calc_summary(chat_id, last_month)
     diff = spent - last_spent
@@ -949,14 +928,13 @@ async def delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Cancelled."); return
     tx_id = int(query.data.replace("del_",""))
     del_tx(tx_id, chat_id)
-    import asyncio; asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, delete=True))
+    asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, delete=True))
     await query.edit_message_text("✅ Transaction deleted.")
 
 async def budget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id); args = ctx.args
     if len(args) < 2:
-        # Show inline keyboard for category selection
-        keyboard = [[InlineKeyboardButton(f"{CAT_ICONS.get(c,'•')} {c.split('/')[0]}", callback_data=f"budcat_{c}")] for c in CATS]
+        keyboard = [[InlineKeyboardButton(f"{cat_obj.icon} {cat_obj.name.split('/')[0]}", callback_data=f"budcat_{cat_obj.name}")] for cat_obj in CATEGORIES]
         await update.message.reply_text("💰 *Which category to set budget for?*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)); return
     try:
         amount = float(args[-1].replace("$","").replace(",",""))
@@ -998,7 +976,6 @@ async def recurring_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     recurrings = get_recurring(chat_id)
 
     if not args:
-        # Show current recurring + options
         text = f"🔁 *Recurring Expenses*\n{'─'*28}\n\n"
         if recurrings:
             for r in recurrings:
@@ -1048,13 +1025,10 @@ async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await summary(update, ctx, month=args[0])
 
 async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show a daily spending summary with an inline date picker."""
     today = datetime.now().strftime("%Y-%m-%d")
     await _send_daily(update, str(update.effective_chat.id), today, is_callback=False)
 
 async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback: bool):
-    """Build and send (or edit) the daily summary message."""
-    # ── data gathering ────────────────────────────────────────────────────────
     txs        = get_txs_by_date(chat_id, date_str)
     expenses   = [t for t in txs if t[2] == "expense"]
     total_today = sum(t[3] for t in expenses)
@@ -1064,14 +1038,12 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
     budgets    = get_budgets(chat_id)
     total_budget = sum(budgets.values())
 
-    # daily average = month_spent / elapsed days
     try:
         day_num   = int(date_str[8:])
         daily_avg = month_spent / day_num if day_num else 0
     except Exception:
         daily_avg = 0
 
-    # budget left today  (pro-rated daily budget minus today's spend)
     try:
         from calendar import monthrange
         days_in_month = monthrange(int(date_str[:4]), int(date_str[5:7]))[1]
@@ -1081,12 +1053,10 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
         daily_budget_share = 0
         budget_left_today  = 0
 
-    # category breakdown for today
     by_cat_today: dict = {}
     for t in expenses:
         by_cat_today[t[5]] = by_cat_today.get(t[5], 0) + t[3]
 
-    # ── format label ─────────────────────────────────────────────────────────
     today_dt   = datetime.now().strftime("%Y-%m-%d")
     date_dt    = datetime.strptime(date_str, "%Y-%m-%d")
     if date_str == today_dt:
@@ -1096,30 +1066,24 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
     else:
         date_label = date_dt.strftime("%A, %d %b %Y")
 
-    # ── build message ─────────────────────────────────────────────────────────
     text = f"📅 *Daily Summary — {date_label}*\n{'─'*30}\n\n"
 
     if not expenses:
         text += "🎉 *No spending today!*\n_Great job keeping the wallet closed_ 👏\n\n"
     else:
-        # transaction list
         text += "*Transactions:*\n"
         for t in expenses:
             icon = CAT_ICONS.get(t[5], "•")
             text += f"{icon} {fmt(t[3])}  _{t[4]}_  · `{t[5].split('/')[0]}`\n"
         text += "\n"
-
-        # total today
         text += f"💸 *Total today:* {fmt(total_today)}\n"
 
-        # vs daily average
         if daily_avg > 0:
             diff    = total_today - daily_avg
             arrow   = "📈" if diff > 0 else "📉"
             diff_str = f"+{fmt(abs(diff))}" if diff > 0 else f"-{fmt(abs(diff))}"
             text += f"{arrow} vs daily avg: *{fmt(daily_avg)}*  ({diff_str})\n"
 
-        # category breakdown
         if by_cat_today:
             text += f"\n*By category:*\n"
             for cat, amt in sorted(by_cat_today.items(), key=lambda x: -x[1]):
@@ -1134,22 +1098,18 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
                     text += f"{icon} {cat}: *{fmt(amt)}*\n"
         text += "\n"
 
-    # ── budget left today line ────────────────────────────────────────────────
     if total_budget and daily_budget_share > 0:
         if budget_left_today >= 0:
             text += f"✅ *Daily budget left:* {fmt(budget_left_today)}\n"
         else:
             text += f"⚠️ *Over daily budget by:* {fmt(abs(budget_left_today))}\n"
 
-    # ── monthly running total ─────────────────────────────────────────────────
     text += f"\n📊 *{month_label(month)} so far:* {fmt(month_spent)}"
     if total_budget:
         pct_month = (month_spent / total_budget * 100)
         text += f"  /  {fmt(total_budget)}  {budget_status(pct_month)}"
     text += "\n"
 
-    # ── date picker inline keyboard ───────────────────────────────────────────
-    # show 5 days: 2 before, today, 2 after (capped to today)
     pivot    = datetime.strptime(date_str, "%Y-%m-%d")
     base_day = min(pivot, datetime.strptime(today_dt, "%Y-%m-%d"))
     dates    = [base_day - timedelta(days=i) for i in range(4, -1, -1)]
@@ -1175,13 +1135,11 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
         )
 
 async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle date navigation in /daily."""
     query = update.callback_query; await query.answer()
     chat_id = str(update.effective_chat.id)
-    data    = query.data  # "daily_YYYY-MM-DD"  or  "daily_prev_YYYY-MM-DD"
+    data    = query.data
 
     if data.startswith("daily_prev_"):
-        # shift the window 5 days earlier
         anchor    = datetime.strptime(data.replace("daily_prev_", ""), "%Y-%m-%d")
         new_date  = (anchor - timedelta(days=5)).strftime("%Y-%m-%d")
     else:
@@ -1189,9 +1147,7 @@ async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     await _send_daily(query, chat_id, new_date, is_callback=True)
 
-
 async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle persistent reply keyboard button taps."""
     text = update.message.text
     mapping = {
         "📊 Summary": summary,
@@ -1213,7 +1169,6 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── SCHEDULED TASKS ───────────────────────────────────────────────────────────
 async def weekly_digest(app):
-    """Send weekly summary every Sunday."""
     chats = get_all_chats()
     for chat_id in chats:
         try:
@@ -1242,7 +1197,6 @@ async def weekly_digest(app):
             print(f"Weekly digest error for {chat_id}: {e}")
 
 async def process_recurring(app):
-    """Auto-log recurring expenses on their due date."""
     today = datetime.now()
     chats = get_all_chats()
     for chat_id in chats:
@@ -1251,7 +1205,8 @@ async def process_recurring(app):
             if r[5] == today.day:
                 date = today.strftime("%Y-%m-%d")
                 tx_info = add_tx(chat_id, "expense", r[2], r[3], r[4], date, "Auto")
-                await gs_sync_async(chat_id, *tx_info)
+                # Use create_task here consistently (was incorrectly awaited before)
+                asyncio.create_task(gs_sync_async(chat_id, *tx_info))
                 icon = CAT_ICONS.get(r[4],"•")
                 try:
                     await app.bot.send_message(
@@ -1272,7 +1227,6 @@ def main():
     try:
         app = Application.builder().token(TOKEN).build()
 
-        # Commands
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("help", help_cmd))
         app.add_handler(CommandHandler("add", add_expense))
@@ -1287,21 +1241,17 @@ def main():
         app.add_handler(CommandHandler("recurring", recurring_cmd))
         app.add_handler(CommandHandler("month", month_cmd))
         app.add_handler(CommandHandler("daily", daily_cmd))
-        app.add_handler(CommandHandler("help", help_cmd))
 
-        # Callbacks
         app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
         app.add_handler(CallbackQueryHandler(quickcat_callback, pattern="^quickcat_"))
         app.add_handler(CallbackQueryHandler(budcat_callback, pattern="^budcat_"))
         app.add_handler(CallbackQueryHandler(delrec_callback, pattern="^delrec_"))
         app.add_handler(CallbackQueryHandler(daily_callback, pattern="^daily_"))
 
-        # Smart quick-add (non-command messages)
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_keyboard))
         app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
-        # Scheduler
         scheduler = AsyncIOScheduler()
         scheduler.add_job(weekly_digest, 'cron', day_of_week='sun', hour=9, minute=0, args=[app])
         scheduler.add_job(process_recurring, 'cron', hour=8, minute=0, args=[app])
