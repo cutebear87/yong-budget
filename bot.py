@@ -675,9 +675,13 @@ def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
     }
 
     try:
-        spreadsheet.batch_update({"requests": [write_req]})
+        print(f"[CHARTS] Writing scratch data: {len(scratch_grid)} rows x {max_w} cols starting at col {SC}")
+        result = spreadsheet.batch_update({"requests": [write_req]})
+        print(f"[CHARTS] Scratch write OK: {result.get('spreadsheetId','?')}")
     except Exception as e:
-        print(f"Chart scratch write error: {e}")
+        import traceback
+        print(f"[CHARTS] Chart scratch write error: {e}")
+        print(traceback.format_exc())
         return
 
     # ── STEP 2: build chart specs referencing the now-committed ranges ────────
@@ -773,14 +777,21 @@ def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
 
     # ── STEP 3: create all three charts in one batch ──────────────────────────
     try:
-        spreadsheet.batch_update({"requests": [
+        print(f"[CHARTS] sheet_id={sheet_id}, npc={npc}, nc={nc}, nm={nm}, SC={SC}")
+        print(f"[CHARTS] pie_labels={pie_labels}")
+        print(f"[CHARTS] bar_labels={bar_labels}")
+        print(f"[CHARTS] line_labels={line_labels}, line_spent={line_spent}")
+        result = spreadsheet.batch_update({"requests": [
             {"addChart": {"chart": donut_req}},
             {"addChart": {"chart": bar_req}},
             {"addChart": {"chart": line_req}},
         ]})
+        print(f"[CHARTS] batch_update result: {result}")
         print("Charts added successfully.")
     except Exception as e:
-        print(f"_add_charts error: {e}")
+        import traceback
+        print(f"[CHARTS] _add_charts error: {e}")
+        print(traceback.format_exc())
 
 
 def _refresh_dashboard(spreadsheet, chat_id):
