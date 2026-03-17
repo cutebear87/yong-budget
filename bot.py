@@ -596,74 +596,105 @@ def _delete_all_charts(spreadsheet, sheet_id):
 
 def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
     """
-    Embed three charts on the Dashboard sheet, anchored to column H onward:
-      - Donut  : spending by category  (H1)
-      - Bar    : spent vs budget        (H22)
-      - Line   : 3-month spend trend    (H43)
+    Embed three charts on the Dashboard sheet anchored to column H:
+      - Donut : spending by category   (H1)
+      - Bar   : spent vs budget        (H22)
+      - Line  : 3-month spend trend    (H43)
     months_data = [(label, spent_dict), ...] ordered oldest → newest
+
+    Strategy: write all scratch data to cols I–Z (hidden area) FIRST in one
+    batch_update, then issue the addChart requests in a second batch_update.
+    This avoids the race condition where chart ranges are referenced before
+    the data cells exist.
     """
     sheet_id = ws.id
 
-    # Colours matching mockup (one per category, cycling if needed)
-    CHART_COLORS = [
-        {"red": 0.259, "green": 0.522, "blue": 0.957},  # blue
-        {"red": 0.918, "green": 0.263, "blue": 0.208},  # red
-        {"red": 0.204, "green": 0.659, "blue": 0.325},  # green
-        {"red": 0.984, "green": 0.737, "blue": 0.016},  # yellow
-        {"red": 0.576, "green": 0.204, "blue": 0.902},  # purple
-        {"red": 0.0,   "green": 0.737, "blue": 0.831},  # cyan
-        {"red": 1.0,   "green": 0.439, "blue": 0.263},  # orange
-        {"red": 0.404, "green": 0.227, "blue": 0.718},  # deep purple
-        {"red": 0.298, "green": 0.686, "blue": 0.314},  # light green
-    ]
-
     active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
+    spending_cats = [c for c in active_cats if by_cat.get(c, 0) > 0]
     if not active_cats:
         return
 
-    def anchor(row, col=7):  # col 7 = column H (0-indexed)
+    # ── Scratch layout (col I = index 8, all 0-indexed) ───────────────────────
+    # Row 1  (idx 0): pie category labels
+    # Row 2  (idx 1): pie category values
+    # Row 4  (idx 3): bar category labels
+    # Row 5  (idx 4): bar budget values
+    # Row 6  (idx 5): bar spent values
+    # Row 8  (idx 7): line month labels
+    # Row 9  (idx 8): line total spent per month
+    # Row 10 (idx 9): line budget reference (flat)
+
+    SC = 8  # scratch start column index (col I)
+
+    pie_labels     = [c for c in spending_cats]
+    pie_values     = [round(by_cat.get(c, 0), 2) for c in spending_cats]
+    bar_labels     = active_cats
+    bar_budgets_v  = [budgets.get(c, 0) for c in active_cats]
+    bar_spent_v    = [round(by_cat.get(c, 0), 2) for c in active_cats]
+    line_labels    = [m[0] for m in months_data]
+    line_spent     = [round(sum(m[1].values()), 2) for m in months_data]
+    total_budget   = sum(budgets.values())
+    line_budget    = [total_budget] * len(months_data)
+
+    nc  = len(active_cats)
+    npc = len(spending_cats)
+    nm  = len(months_data)
+
+    # ── STEP 1: write all scratch data in one call ────────────────────────────
+    scratch_grid = [
+        pie_labels  + [""] * (max(nc, nm) - npc),   # row 1  (idx 0)
+        pie_values  + [""] * (max(nc, nm) - npc),   # row 2  (idx 1)
+        [""],                                         # row 3  (idx 2) spacer
+        bar_labels,                                   # row 4  (idx 3)
+        bar_budgets_v,                                # row 5  (idx 4)
+        bar_spent_v,                                  # row 6  (idx 5)
+        [""],                                         # row 7  (idx 6) spacer
+        line_labels,                                  # row 8  (idx 7)
+        line_spent,                                   # row 9  (idx 8)
+        line_budget,                                  # row 10 (idx 9)
+    ]
+
+    # Pad all rows to same width
+    max_w = max(len(r) for r in scratch_grid)
+    scratch_grid = [r + [""] * (max_w - len(r)) for r in scratch_grid]
+
+    # Convert to Sheets batchUpdate updateCells request (bypasses gspread rate limits)
+    def _cell(v):
+        if isinstance(v, (int, float)):
+            return {"userEnteredValue": {"numberValue": v}}
+        return {"userEnteredValue": {"stringValue": str(v)}}
+
+    rows_data = [{"values": [_cell(v) for v in row]} for row in scratch_grid]
+
+    write_req = {
+        "updateCells": {
+            "rows": rows_data,
+            "fields": "userEnteredValue",
+            "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": SC},
+        }
+    }
+
+    try:
+        spreadsheet.batch_update({"requests": [write_req]})
+    except Exception as e:
+        print(f"Chart scratch write error: {e}")
+        return
+
+    # ── STEP 2: build chart specs referencing the now-committed ranges ────────
+    def src(r1, r2, c1, c2):
+        return {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
+                "startColumnIndex": c1, "endColumnIndex": c2}
+
+    def anchor(row, col=8):  # col 8 = column I (0-indexed) — charts sit right of data
         return {
             "overlayPosition": {
                 "anchorCell": {"sheetId": sheet_id, "rowIndex": row, "columnIndex": col},
-                "offsetXPixels": 0, "offsetYPixels": 0,
-                "widthPixels": 520, "heightPixels": 300,
+                "offsetXPixels": 10, "offsetYPixels": 0,
+                "widthPixels": 500, "heightPixels": 280,
             }
         }
 
-    # ── 1. Donut — spending by category ───────────────────────────────────────
-    donut_series = []
-    for i, cat in enumerate(active_cats):
-        amt = round(by_cat.get(cat, 0), 2)
-        if amt > 0:
-            donut_series.append((cat, amt, CHART_COLORS[i % len(CHART_COLORS)]))
-
-    donut_chart = {
-        "spec": {
-            "title": f"Spending by category — {month_label()}",
-            "titleTextFormat": {"bold": True, "fontSize": 11},
-            "pieChart": {
-                "legendPosition": "RIGHT_LEGEND",
-                "pieHole": 0.5,
-                "series": {
-                    "data": {
-                        "sourceRange": {"sources": []}  # We use domain+series approach below
-                    }
-                },
-                "domain": {
-                    "data": {
-                        "sourceRange": {"sources": []}
-                    }
-                },
-            },
-            "basicChart": None,
-        },
-        "position": anchor(1),
-    }
-
-    # Sheets pie charts are easier built with domain/series data arrays
-    pie_labels = [cat for cat, _, _ in donut_series]
-    pie_values = [amt for _, amt, _ in donut_series]
-
+    # Donut — rows 1-2, SC..SC+npc
     donut_req = {
         "spec": {
             "title": f"Spending by category — {month_label()}",
@@ -671,57 +702,14 @@ def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
             "pieChart": {
                 "legendPosition": "RIGHT_LEGEND",
                 "pieHole": 0.5,
-                "domain": {"data": {"sourceRange": {"sources": [
-                    {"sheetId": sheet_id,
-                     "startRowIndex": 0, "endRowIndex": 1,
-                     "startColumnIndex": 20, "endColumnIndex": 20 + len(pie_labels)}
-                ]}}},
-                "series": {"data": {"sourceRange": {"sources": [
-                    {"sheetId": sheet_id,
-                     "startRowIndex": 1, "endRowIndex": 2,
-                     "startColumnIndex": 20, "endColumnIndex": 20 + len(pie_labels)}
-                ]}}},
-            }
+                "domain": {"data": {"sourceRange": {"sources": [src(0, 1, SC, SC + npc)]}}},
+                "series": {"data": {"sourceRange": {"sources": [src(1, 2, SC, SC + npc)]}}},
+            },
         },
         "position": anchor(1),
     }
 
-    # ── 2. Grouped bar — spent vs budget per category ─────────────────────────
-    bar_cats   = active_cats
-    bar_budgets = [budgets.get(c, 0) for c in bar_cats]
-    bar_spent   = [round(by_cat.get(c, 0), 2) for c in bar_cats]
-
-    # Write helper data to a scratch area (cols T onward, rows 4-6) so charts
-    # can reference real sheet ranges (Sheets API requires range refs, not inline data)
-    scratch_start_col = 19  # col T (0-indexed)
-
-    try:
-        # Row 1 (idx 0): pie labels
-        ws.update(f"U1", [pie_labels], value_input_option="USER_ENTERED")
-        ws.update(f"U2", [pie_values], value_input_option="USER_ENTERED")
-        # Row 4: bar labels
-        ws.update(f"U4", [bar_cats], value_input_option="USER_ENTERED")
-        ws.update(f"U5", [bar_budgets], value_input_option="USER_ENTERED")
-        ws.update(f"U6", [bar_spent], value_input_option="USER_ENTERED")
-        # Rows 8-10: line chart (months as cols)
-        month_labels_list = [m[0] for m in months_data]
-        ws.update(f"U8",  [month_labels_list], value_input_option="USER_ENTERED")
-        total_by_month = [round(sum(m[1].values()), 2) for m in months_data]
-        ws.update(f"U9",  [total_by_month], value_input_option="USER_ENTERED")
-        total_budget = sum(budgets.values())
-        ws.update(f"U10", [[total_budget] * len(months_data)], value_input_option="USER_ENTERED")
-    except Exception as e:
-        print(f"Chart scratch data error: {e}")
-        return
-
-    nc = len(bar_cats)
-    nm = len(months_data)
-    sc = scratch_start_col  # 19 = col T, data starts col U = 20
-
-    def src(r1, r2, c1, c2):
-        return {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
-                "startColumnIndex": c1, "endColumnIndex": c2}
-
+    # Bar — rows 4-6, SC..SC+nc
     bar_req = {
         "spec": {
             "title": "Spent vs budget by category",
@@ -733,28 +721,26 @@ def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
                     {"position": "BOTTOM_AXIS", "title": "SGD ($)"},
                     {"position": "LEFT_AXIS",   "title": "Category"},
                 ],
-                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(3, 4, sc+1, sc+1+nc)]}}}}],
+                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(3, 4, SC, SC + nc)]}}}}],
                 "series": [
                     {
-                        "series": {"data": {"sourceRange": {"sources": [src(4, 5, sc+1, sc+1+nc)]}}},
+                        "series": {"data": {"sourceRange": {"sources": [src(4, 5, SC, SC + nc)]}}},
                         "targetAxis": "BOTTOM_AXIS",
-                        "color": {"red": 0.235, "green": 0.522, "blue": 0.282},
-                        "dataLabel": {"type": "NONE"},
+                        "color": {"red": 0.204, "green": 0.659, "blue": 0.325},
                     },
                     {
-                        "series": {"data": {"sourceRange": {"sources": [src(5, 6, sc+1, sc+1+nc)]}}},
+                        "series": {"data": {"sourceRange": {"sources": [src(5, 6, SC, SC + nc)]}}},
                         "targetAxis": "BOTTOM_AXIS",
                         "color": {"red": 0.918, "green": 0.263, "blue": 0.208},
-                        "dataLabel": {"type": "NONE"},
                     },
                 ],
                 "headerCount": 1,
-            }
+            },
         },
         "position": anchor(22),
     }
 
-    # ── 3. Line — 3-month total spend trend ───────────────────────────────────
+    # Line — rows 8-10, SC..SC+nm
     line_req = {
         "spec": {
             "title": "3-month spending trend",
@@ -766,33 +752,33 @@ def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
                     {"position": "BOTTOM_AXIS", "title": "Month"},
                     {"position": "LEFT_AXIS",   "title": "SGD ($)"},
                 ],
-                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(7, 8, sc+1, sc+1+nm)]}}}}],
+                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(7, 8, SC, SC + nm)]}}}}],
                 "series": [
                     {
-                        "series": {"data": {"sourceRange": {"sources": [src(8, 9, sc+1, sc+1+nm)]}}},
+                        "series": {"data": {"sourceRange": {"sources": [src(8, 9, SC, SC + nm)]}}},
                         "targetAxis": "LEFT_AXIS",
                         "color": {"red": 0.259, "green": 0.522, "blue": 0.957},
-                        "lineStyle": {"type": "SOLID", "width": 2},
                     },
                     {
-                        "series": {"data": {"sourceRange": {"sources": [src(9, 10, sc+1, sc+1+nm)]}}},
+                        "series": {"data": {"sourceRange": {"sources": [src(9, 10, SC, SC + nm)]}}},
                         "targetAxis": "LEFT_AXIS",
-                        "color": {"red": 0.6, "green": 0.6, "blue": 0.6},
-                        "lineStyle": {"type": "DOTTED", "width": 1},
+                        "color": {"red": 0.7, "green": 0.7, "blue": 0.7},
                     },
                 ],
                 "headerCount": 1,
-            }
+            },
         },
         "position": anchor(43),
     }
 
+    # ── STEP 3: create all three charts in one batch ──────────────────────────
     try:
         spreadsheet.batch_update({"requests": [
             {"addChart": {"chart": donut_req}},
             {"addChart": {"chart": bar_req}},
             {"addChart": {"chart": line_req}},
         ]})
+        print("Charts added successfully.")
     except Exception as e:
         print(f"_add_charts error: {e}")
 
