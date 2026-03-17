@@ -578,6 +578,225 @@ def _refresh_summary_sheet(spreadsheet, chat_id):
     _autofit_cols(ws, len(headers))
 
 # ── Dashboard sheet ───────────────────────────────────────────────────────────
+def _delete_all_charts(spreadsheet, sheet_id):
+    """Remove all existing charts from a sheet so we don't stack duplicates on refresh."""
+    try:
+        meta = spreadsheet.fetch_sheet_metadata()
+        sheets = meta.get("sheets", [])
+        for s in sheets:
+            if s["properties"]["sheetId"] == sheet_id:
+                charts = s.get("charts", [])
+                if not charts:
+                    return
+                reqs = [{"deleteEmbeddedObject": {"objectId": c["chartId"]}} for c in charts]
+                spreadsheet.batch_update({"requests": reqs})
+                return
+    except Exception as e:
+        print(f"_delete_all_charts error: {e}")
+
+def _add_charts(spreadsheet, ws, by_cat, budgets, months_data):
+    """
+    Embed three charts on the Dashboard sheet, anchored to column H onward:
+      - Donut  : spending by category  (H1)
+      - Bar    : spent vs budget        (H22)
+      - Line   : 3-month spend trend    (H43)
+    months_data = [(label, spent_dict), ...] ordered oldest → newest
+    """
+    sheet_id = ws.id
+
+    # Colours matching mockup (one per category, cycling if needed)
+    CHART_COLORS = [
+        {"red": 0.259, "green": 0.522, "blue": 0.957},  # blue
+        {"red": 0.918, "green": 0.263, "blue": 0.208},  # red
+        {"red": 0.204, "green": 0.659, "blue": 0.325},  # green
+        {"red": 0.984, "green": 0.737, "blue": 0.016},  # yellow
+        {"red": 0.576, "green": 0.204, "blue": 0.902},  # purple
+        {"red": 0.0,   "green": 0.737, "blue": 0.831},  # cyan
+        {"red": 1.0,   "green": 0.439, "blue": 0.263},  # orange
+        {"red": 0.404, "green": 0.227, "blue": 0.718},  # deep purple
+        {"red": 0.298, "green": 0.686, "blue": 0.314},  # light green
+    ]
+
+    active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
+    if not active_cats:
+        return
+
+    def anchor(row, col=7):  # col 7 = column H (0-indexed)
+        return {
+            "overlayPosition": {
+                "anchorCell": {"sheetId": sheet_id, "rowIndex": row, "columnIndex": col},
+                "offsetXPixels": 0, "offsetYPixels": 0,
+                "widthPixels": 520, "heightPixels": 300,
+            }
+        }
+
+    # ── 1. Donut — spending by category ───────────────────────────────────────
+    donut_series = []
+    for i, cat in enumerate(active_cats):
+        amt = round(by_cat.get(cat, 0), 2)
+        if amt > 0:
+            donut_series.append((cat, amt, CHART_COLORS[i % len(CHART_COLORS)]))
+
+    donut_chart = {
+        "spec": {
+            "title": f"Spending by category — {month_label()}",
+            "titleTextFormat": {"bold": True, "fontSize": 11},
+            "pieChart": {
+                "legendPosition": "RIGHT_LEGEND",
+                "pieHole": 0.5,
+                "series": {
+                    "data": {
+                        "sourceRange": {"sources": []}  # We use domain+series approach below
+                    }
+                },
+                "domain": {
+                    "data": {
+                        "sourceRange": {"sources": []}
+                    }
+                },
+            },
+            "basicChart": None,
+        },
+        "position": anchor(1),
+    }
+
+    # Sheets pie charts are easier built with domain/series data arrays
+    pie_labels = [cat for cat, _, _ in donut_series]
+    pie_values = [amt for _, amt, _ in donut_series]
+
+    donut_req = {
+        "spec": {
+            "title": f"Spending by category — {month_label()}",
+            "titleTextFormat": {"bold": True, "fontSize": 11},
+            "pieChart": {
+                "legendPosition": "RIGHT_LEGEND",
+                "pieHole": 0.5,
+                "domain": {"data": {"sourceRange": {"sources": [
+                    {"sheetId": sheet_id,
+                     "startRowIndex": 0, "endRowIndex": 1,
+                     "startColumnIndex": 20, "endColumnIndex": 20 + len(pie_labels)}
+                ]}}},
+                "series": {"data": {"sourceRange": {"sources": [
+                    {"sheetId": sheet_id,
+                     "startRowIndex": 1, "endRowIndex": 2,
+                     "startColumnIndex": 20, "endColumnIndex": 20 + len(pie_labels)}
+                ]}}},
+            }
+        },
+        "position": anchor(1),
+    }
+
+    # ── 2. Grouped bar — spent vs budget per category ─────────────────────────
+    bar_cats   = active_cats
+    bar_budgets = [budgets.get(c, 0) for c in bar_cats]
+    bar_spent   = [round(by_cat.get(c, 0), 2) for c in bar_cats]
+
+    # Write helper data to a scratch area (cols T onward, rows 4-6) so charts
+    # can reference real sheet ranges (Sheets API requires range refs, not inline data)
+    scratch_start_col = 19  # col T (0-indexed)
+
+    try:
+        # Row 1 (idx 0): pie labels
+        ws.update(f"U1", [pie_labels], value_input_option="USER_ENTERED")
+        ws.update(f"U2", [pie_values], value_input_option="USER_ENTERED")
+        # Row 4: bar labels
+        ws.update(f"U4", [bar_cats], value_input_option="USER_ENTERED")
+        ws.update(f"U5", [bar_budgets], value_input_option="USER_ENTERED")
+        ws.update(f"U6", [bar_spent], value_input_option="USER_ENTERED")
+        # Rows 8-10: line chart (months as cols)
+        month_labels_list = [m[0] for m in months_data]
+        ws.update(f"U8",  [month_labels_list], value_input_option="USER_ENTERED")
+        total_by_month = [round(sum(m[1].values()), 2) for m in months_data]
+        ws.update(f"U9",  [total_by_month], value_input_option="USER_ENTERED")
+        total_budget = sum(budgets.values())
+        ws.update(f"U10", [[total_budget] * len(months_data)], value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"Chart scratch data error: {e}")
+        return
+
+    nc = len(bar_cats)
+    nm = len(months_data)
+    sc = scratch_start_col  # 19 = col T, data starts col U = 20
+
+    def src(r1, r2, c1, c2):
+        return {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
+                "startColumnIndex": c1, "endColumnIndex": c2}
+
+    bar_req = {
+        "spec": {
+            "title": "Spent vs budget by category",
+            "titleTextFormat": {"bold": True, "fontSize": 11},
+            "basicChart": {
+                "chartType": "BAR",
+                "legendPosition": "BOTTOM_LEGEND",
+                "axis": [
+                    {"position": "BOTTOM_AXIS", "title": "SGD ($)"},
+                    {"position": "LEFT_AXIS",   "title": "Category"},
+                ],
+                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(3, 4, sc+1, sc+1+nc)]}}}}],
+                "series": [
+                    {
+                        "series": {"data": {"sourceRange": {"sources": [src(4, 5, sc+1, sc+1+nc)]}}},
+                        "targetAxis": "BOTTOM_AXIS",
+                        "color": {"red": 0.235, "green": 0.522, "blue": 0.282},
+                        "dataLabel": {"type": "NONE"},
+                    },
+                    {
+                        "series": {"data": {"sourceRange": {"sources": [src(5, 6, sc+1, sc+1+nc)]}}},
+                        "targetAxis": "BOTTOM_AXIS",
+                        "color": {"red": 0.918, "green": 0.263, "blue": 0.208},
+                        "dataLabel": {"type": "NONE"},
+                    },
+                ],
+                "headerCount": 1,
+            }
+        },
+        "position": anchor(22),
+    }
+
+    # ── 3. Line — 3-month total spend trend ───────────────────────────────────
+    line_req = {
+        "spec": {
+            "title": "3-month spending trend",
+            "titleTextFormat": {"bold": True, "fontSize": 11},
+            "basicChart": {
+                "chartType": "LINE",
+                "legendPosition": "BOTTOM_LEGEND",
+                "axis": [
+                    {"position": "BOTTOM_AXIS", "title": "Month"},
+                    {"position": "LEFT_AXIS",   "title": "SGD ($)"},
+                ],
+                "domains": [{"domain": {"data": {"sourceRange": {"sources": [src(7, 8, sc+1, sc+1+nm)]}}}}],
+                "series": [
+                    {
+                        "series": {"data": {"sourceRange": {"sources": [src(8, 9, sc+1, sc+1+nm)]}}},
+                        "targetAxis": "LEFT_AXIS",
+                        "color": {"red": 0.259, "green": 0.522, "blue": 0.957},
+                        "lineStyle": {"type": "SOLID", "width": 2},
+                    },
+                    {
+                        "series": {"data": {"sourceRange": {"sources": [src(9, 10, sc+1, sc+1+nm)]}}},
+                        "targetAxis": "LEFT_AXIS",
+                        "color": {"red": 0.6, "green": 0.6, "blue": 0.6},
+                        "lineStyle": {"type": "DOTTED", "width": 1},
+                    },
+                ],
+                "headerCount": 1,
+            }
+        },
+        "position": anchor(43),
+    }
+
+    try:
+        spreadsheet.batch_update({"requests": [
+            {"addChart": {"chart": donut_req}},
+            {"addChart": {"chart": bar_req}},
+            {"addChart": {"chart": line_req}},
+        ]})
+    except Exception as e:
+        print(f"_add_charts error: {e}")
+
+
 def _refresh_dashboard(spreadsheet, chat_id):
     month   = get_month()
     budgets = get_budgets(chat_id)
@@ -585,6 +804,14 @@ def _refresh_dashboard(spreadsheet, chat_id):
 
     last_month        = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
     _, last_spent, _  = calc_summary(chat_id, last_month)
+
+    # Build 3-month data for line chart (oldest → newest)
+    dt = datetime.strptime(month, "%Y-%m")
+    months_list = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
+    months_data = [
+        (datetime.strptime(m, "%Y-%m").strftime("%b %Y"), calc_summary(chat_id, m)[2])
+        for m in months_list
+    ]
 
     total_budget  = sum(budgets.values())
     remaining     = income - spent
@@ -595,7 +822,8 @@ def _refresh_dashboard(spreadsheet, chat_id):
     updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
 
     try:
-        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=6)
+        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
+        _delete_all_charts(spreadsheet, ws.id)
         ws.clear()
 
         rows = [
@@ -629,7 +857,7 @@ def _refresh_dashboard(spreadsheet, chat_id):
 
         ws.update("A1", rows, value_input_option="USER_ENTERED")
 
-        requests = []
+        fmt_requests = []
 
         def bold_row(row_idx, bg=None):
             req = {
@@ -643,36 +871,41 @@ def _refresh_dashboard(spreadsheet, chat_id):
             if bg:
                 req["repeatCell"]["cell"]["userEnteredFormat"]["backgroundColor"] = bg
                 req["repeatCell"]["fields"] += ",userEnteredFormat.backgroundColor"
-            requests.append(req)
+            fmt_requests.append(req)
 
         bold_row(0, _HEADER)
-        requests.append({"repeatCell": {"range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
-                                                    "startColumnIndex": 0, "endColumnIndex": 6},
-                          "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": _WHITE, "bold": True, "fontSize": 12}}},
-                          "fields": "userEnteredFormat.textFormat"}})
+        fmt_requests.append({"repeatCell": {
+            "range": {"sheetId": ws.id, "startRowIndex": 0, "endRowIndex": 1,
+                       "startColumnIndex": 0, "endColumnIndex": 6},
+            "cell": {"userEnteredFormat": {"textFormat": {"foregroundColor": _WHITE, "bold": True, "fontSize": 12}}},
+            "fields": "userEnteredFormat.textFormat"
+        }})
         bold_row(2)
         bold_row(6)
         bold_row(7, {"red": 0.902, "green": 0.902, "blue": 0.902})
 
-        for i, cat in enumerate(CATS):
+        active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
+        for i, cat in enumerate(active_cats):
             bud = budgets.get(cat, 0)
             s   = by_cat.get(cat, 0)
-            if not s and not bud:
-                continue
             pct = round(s / bud * 100, 1) if bud else 0
             color = _status_color(pct) if bud else _WHITE
-            row_idx = 8 + [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)].index(cat)
-            requests.append({"repeatCell": {
+            row_idx = 8 + i
+            fmt_requests.append({"repeatCell": {
                 "range": {"sheetId": ws.id, "startRowIndex": row_idx, "endRowIndex": row_idx + 1,
                            "startColumnIndex": 0, "endColumnIndex": 6},
                 "cell": {"userEnteredFormat": {"backgroundColor": color}},
                 "fields": "userEnteredFormat.backgroundColor",
             }})
 
-        if requests:
-            spreadsheet.batch_update({"requests": requests})
+        if fmt_requests:
+            spreadsheet.batch_update({"requests": fmt_requests})
 
         _autofit_cols(ws, 6)
+
+        # Add the three charts (donut, bar, line) anchored to column H
+        _add_charts(spreadsheet, ws, by_cat, budgets, months_data)
+
     except Exception as e:
         print(f"_refresh_dashboard error: {e}")
 
@@ -1523,6 +1756,32 @@ async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await smart_add(update, ctx)
 
+async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Force-rebuild all Google Sheets tabs immediately."""
+    chat_id = str(update.effective_chat.id)
+    if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
+        await update.message.reply_text(
+            "⚠️ Google Sheets not configured.\nAdd `GOOGLE_SHEETS_CREDS` and `GOOGLE_SHEET_ID` to your environment.",
+            parse_mode="Markdown"
+        )
+        return
+    msg = await update.message.reply_text("🔄 Refreshing Google Sheets... give me a moment!")
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, gs_refresh_summary, chat_id)
+        await msg.edit_text(
+            "✅ *Google Sheets updated!*\n\n"
+            "All 4 tabs have been rebuilt:\n"
+            "• Dashboard (with charts)\n"
+            "• Transactions\n"
+            "• Budget Tracker\n"
+            "• Summary",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"refresh_sheets_cmd error: {e}")
+        await msg.edit_text("❌ Something went wrong refreshing the sheets. Check server logs.")
+
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤷 Unknown command. Type /help to see all commands.")
 
@@ -1600,6 +1859,7 @@ def main():
         app.add_handler(CommandHandler("recurring", recurring_cmd))
         app.add_handler(CommandHandler("month", month_cmd))
         app.add_handler(CommandHandler("daily", daily_cmd))
+        app.add_handler(CommandHandler("refreshsheets", refresh_sheets_cmd))
 
         app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
         app.add_handler(CallbackQueryHandler(quickcat_callback, pattern="^quickcat_"))
