@@ -789,11 +789,21 @@ def _refresh_dashboard(spreadsheet, chat_id):
     budgets = get_budgets(chat_id)
     _, _, by_cat = calc_summary(chat_id, month)
 
+    # Step 1: delete old charts BEFORE clearing/rewriting the sheet
+    try:
+        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
+        _delete_all_charts(spreadsheet, ws.id)
+    except Exception as e:
+        print(f"_refresh_dashboard delete charts error: {e}")
+
+    # Step 2: write dashboard data + scratch rows
     try:
         _refresh_dashboard_data(spreadsheet, chat_id)
     except Exception as e:
         print(f"_refresh_dashboard data error: {e}")
+        return
 
+    # Step 3: add charts — scratch data is now committed
     try:
         dt = datetime.strptime(month, "%Y-%m")
         months_list = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
@@ -801,8 +811,7 @@ def _refresh_dashboard(spreadsheet, chat_id):
             (datetime.strptime(m, "%Y-%m").strftime("%b %Y"), calc_summary(chat_id, m)[2])
             for m in months_list
         ]
-        ws = spreadsheet.worksheet(SHEET_DASHBOARD)
-        _delete_all_charts(spreadsheet, ws.id)
+        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
         _add_charts(spreadsheet, ws, by_cat, budgets, months_data)
     except Exception as e:
         print(f"_refresh_dashboard charts error: {e}")
@@ -1744,7 +1753,8 @@ def _refresh_dashboard_data(spreadsheet, chat_id):
     updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
 
     ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=30)
-    ws.clear()
+    # Only clear the visible data area (A:G), preserve scratch cols I+ used by charts
+    ws.batch_clear(["A1:G1000"])
 
     rows = [
         [f"Family Budget Dashboard — {month_label(month)}", "", "", "", "", f"Updated: {updated_at}"],
