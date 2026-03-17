@@ -663,8 +663,97 @@ def _refresh_summary_sheet(spreadsheet, chat_id):
 # ── Dashboard sheet ───────────────────────────────────────────────────────────
 def _refresh_dashboard(spreadsheet, chat_id):
     """Write dashboard data only."""
+    month   = get_month()
+    budgets = get_budgets(chat_id)
+    income, spent, by_cat = calc_summary(chat_id, month)
+    last_month       = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    _, last_spent, _ = calc_summary(chat_id, last_month)
+    total_budget  = sum(budgets.values())
+    remaining     = income - spent
+    savings_rate  = round(remaining / income * 100, 1) if income > 0 else 0
+    budget_pct    = round(spent / total_budget * 100, 1) if total_budget else 0
+    mom_diff      = round(spent - last_spent, 2)
+    mom_arrow     = "▲" if mom_diff > 0 else "▼"
+    updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
+
     try:
-        _refresh_dashboard_data(spreadsheet, chat_id)
+        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=8)
+        sheet_id = ws.id
+
+        rows = [
+            [f"Family Budget Dashboard — {month_label(month)}", "", "", "", "", f"Updated: {updated_at}"],
+            [""],
+            ["MONTHLY OVERVIEW", "", "", "", "", ""],
+            ["Income", f"${income:,.2f}", "Spent", f"${spent:,.2f}", "Remaining", f"${remaining:,.2f}"],
+            ["Savings rate", f"{savings_rate}%", "Budget used", f"{budget_pct}%", "vs Last Month", f"{mom_arrow} ${abs(mom_diff):,.2f}"],
+            [""],
+            ["CATEGORY BREAKDOWN", "", "", "", "", ""],
+            ["Category", "Budget", "Spent", "Remaining", "Progress", "Status"],
+        ]
+        active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
+        for cat in active_cats:
+            bud    = budgets.get(cat, 0)
+            s      = round(by_cat.get(cat, 0), 2)
+            rem    = round(bud - s, 2) if bud else ""
+            pct    = round(s / bud * 100, 1) if bud else 0
+            bar    = _progress_bar_str(pct) if bud else ""
+            status = _status_text(pct) if bud else "—"
+            rows.append([cat, bud or "", s, rem, bar, status])
+        rows += [[""], ["TOP 3 SPENDING CATEGORIES", "", "", "", "", ""]]
+        for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])[:3]:
+            rows.append([cat, f"${amt:,.2f}", "", "", "", ""])
+
+        def _cv(v):
+            if isinstance(v, (int, float)): return {"userEnteredValue": {"numberValue": v}}
+            return {"userEnteredValue": {"stringValue": str(v)}}
+
+        cell_rows = [{"values": [_cv(v) for v in r]} for r in rows]
+
+        fmt_reqs = [
+            {"updateCells": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
+                          "startColumnIndex": 0, "endColumnIndex": 8},
+                "fields": "userEnteredValue,userEnteredFormat",
+            }},
+            {"updateCells": {
+                "rows": cell_rows, "fields": "userEnteredValue",
+                "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
+            }},
+            {"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                          "startColumnIndex": 0, "endColumnIndex": 6},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": _HEADER,
+                    "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 12},
+                }},
+                "fields": "userEnteredFormat",
+            }},
+            {"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 7, "endRowIndex": 8,
+                          "startColumnIndex": 0, "endColumnIndex": 6},
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": {"red": 0.902, "green": 0.902, "blue": 0.902},
+                    "textFormat": {"bold": True},
+                }},
+                "fields": "userEnteredFormat",
+            }},
+            {"autoResizeDimensions": {"dimensions": {
+                "sheetId": sheet_id, "dimension": "COLUMNS",
+                "startIndex": 0, "endIndex": 6,
+            }}},
+        ]
+        for i, cat in enumerate(active_cats):
+            bud   = budgets.get(cat, 0)
+            s     = by_cat.get(cat, 0)
+            pct   = round(s / bud * 100, 1) if bud else 0
+            color = _status_color(pct) if bud else _WHITE
+            fmt_reqs.append({"repeatCell": {
+                "range": {"sheetId": sheet_id, "startRowIndex": 8 + i, "endRowIndex": 9 + i,
+                          "startColumnIndex": 0, "endColumnIndex": 6},
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }})
+        spreadsheet.batch_update({"requests": fmt_reqs})
     except Exception as e:
         print(f"_refresh_dashboard error: {e}")
 
@@ -1581,7 +1670,7 @@ async def refresh_sheets_cmd(update, ctx):
         except Exception as e:
             errors.append(f"Summary sheet: {e}")
         try:
-            _refresh_dashboard_data(spreadsheet, chat_id)
+            _refresh_dashboard(spreadsheet, chat_id)
         except Exception as e:
             errors.append(f"Dashboard: {e}")
     loop = asyncio.get_event_loop()
