@@ -1,227 +1,175 @@
-import os
-import sqlite3
+import os, sqlite3, re, base64, httpx, asyncio, json, time
 from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from typing import List
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters,
-    ConversationHandler
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import re
-import base64
-import httpx
-import asyncio
-import json
 
-TOKEN        = os.environ.get("BOT_TOKEN", "")
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-ALERT_THRESHOLD = 0.8  # 80% budget alert
+TOKEN             = os.environ.get("BOT_TOKEN", "")
+DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS", "")   # service account JSON string
-GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")       # spreadsheet ID from URL
+GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS", "")
+GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")
 
-# ── CATEGORY DEFINITIONS ──────────────────────────────────────────────────────
-@dataclass
-class Category:
-    name: str
-    icon: str
-    keywords: List[str] = field(default_factory=list)
-
-CATEGORIES = [
-    Category("Housing/Rent",      "🏠", ["rent", "mortgage", "condo", "hdb", "housing", "property"]),
-    Category("Groceries",         "🛒", ["grocery", "groceries", "supermarket", "market", "fairprice", "ntuc",
-                                          "cold storage", "giant", "trader", "walmart", "costco",
-                                          "food", "lunch", "dinner", "breakfast", "meal", "supper"]),
-    Category("Dining Out",        "🍽", ["dining", "restaurant", "cafe", "coffee", "starbucks", "mcdonald",
-                                          "burger", "pizza", "sushi", "hawker", "kopitiam", "grab food",
-                                          "deliveroo", "foodpanda", "nobu", "brunch"]),
-    Category("Subscriptions",     "📱", ["netflix", "spotify", "apple", "google", "subscription", "sub",
-                                          "amazon prime", "youtube", "disney", "hulu"]),
-    Category("Transportation",    "🚗", ["grab", "taxi", "uber", "mrt", "bus", "transport", "petrol",
-                                          "gas", "parking", "ez-link", "train", "gojek", "car"]),
-    Category("Utilities",         "⚡", ["electric", "water", "internet", "phone", "bill", "utility",
-                                          "telco", "singtel", "starhub", "m1"]),
-    Category("Entertainment",     "🎬", ["movie", "cinema", "concert", "game", "shopping", "mall", "entertainment"]),
-    Category("Savings",           "💰", ["savings", "save", "investment", "invest", "cpf"]),
-    Category("Personal/Shopping", "🛍", ["shopping", "clothes", "shoes", "haircut", "gym", "beauty",
-                                          "personal", "lazada", "shopee", "amazon"]),
+# CATS order is FIXED — never reorder. Chart ranges A2:C10 depend on row stability.
+CATS = [
+    "Housing/Rent", "Groceries", "Dining Out", "Subscriptions",
+    "Transportation", "Utilities", "Entertainment", "Savings", "Personal/Shopping"
 ]
+CAT_ICONS = {
+    "Housing/Rent":"🏠","Groceries":"🛒","Dining Out":"🍽",
+    "Subscriptions":"📱","Transportation":"🚗","Utilities":"⚡",
+    "Entertainment":"🎬","Savings":"💰","Personal/Shopping":"🛍","Income":"💵"
+}
+CAT_KEYWORDS = {
+    "Groceries":["grocery","groceries","supermarket","market","fairprice","ntuc","cold storage","giant","trader","walmart","costco","food","lunch","dinner","breakfast","meal","supper"],
+    "Dining Out":["dining","restaurant","cafe","coffee","starbucks","mcdonald","burger","pizza","sushi","hawker","kopitiam","grab food","deliveroo","foodpanda","nobu","brunch"],
+    "Transportation":["grab","taxi","uber","mrt","bus","transport","petrol","gas","parking","ez-link","train","gojek","car"],
+    "Subscriptions":["netflix","spotify","apple","google","subscription","sub","amazon prime","youtube","disney","hulu"],
+    "Entertainment":["movie","cinema","concert","game","shopping","mall","entertainment"],
+    "Utilities":["electric","water","internet","phone","bill","utility","telco","singtel","starhub","m1"],
+    "Housing/Rent":["rent","mortgage","condo","hdb","housing","property"],
+    "Savings":["savings","save","investment","invest","cpf"],
+    "Personal/Shopping":["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon"],
+}
 
-# Derived lookups — the rest of the code uses these unchanged
-CATS         = [c.name for c in CATEGORIES]
-CAT_ICONS    = {c.name: c.icon for c in CATEGORIES} | {"Income": "💵"}
-CAT_KEYWORDS = {c.name: c.keywords for c in CATEGORIES}
 
-# ── DATABASE ──────────────────────────────────────────────────────────────────
 def get_conn():
     if DATABASE_URL:
         import psycopg2
-        url = DATABASE_URL.replace("postgres://","postgresql://",1)
-        return psycopg2.connect(url), "pg"
+        return psycopg2.connect(DATABASE_URL.replace("postgres://","postgresql://",1)), "pg"
     return sqlite3.connect("budget.db"), "sqlite"
 
-def ph(db_type):
-    return "%s" if db_type == "pg" else "?"
+def ph(t): return "%s" if t=="pg" else "?"
 
 def init_db():
-    conn, db_type = get_conn()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS transactions (
-        id BIGINT PRIMARY KEY, chat_id TEXT, type TEXT, amount REAL,
-        description TEXT, category TEXT, date TEXT, added_by TEXT, month TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS budgets (
-        chat_id TEXT, category TEXT, amount REAL, PRIMARY KEY (chat_id, category))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS recurring (
-        id BIGINT PRIMARY KEY, chat_id TEXT, amount REAL,
-        description TEXT, category TEXT, day_of_month INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
-        chat_id TEXT PRIMARY KEY, weekly_digest BOOLEAN DEFAULT TRUE,
-        alert_threshold REAL DEFAULT 0.8)""")
-    conn.commit(); conn.close()
-    print("Database initialized OK.")
+    conn, db_type = get_conn(); cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS transactions (id BIGINT PRIMARY KEY, chat_id TEXT, type TEXT, amount REAL, description TEXT, category TEXT, date TEXT, added_by TEXT, month TEXT)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS budgets (chat_id TEXT, category TEXT, amount REAL, PRIMARY KEY (chat_id, category))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS recurring (id BIGINT PRIMARY KEY, chat_id TEXT, amount REAL, description TEXT, category TEXT, day_of_month INTEGER)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS settings (chat_id TEXT PRIMARY KEY, weekly_digest BOOLEAN DEFAULT TRUE, alert_threshold REAL DEFAULT 0.8)""")
+    conn.commit(); conn.close(); print("Database initialized OK.")
 
 def get_txs(chat_id, month=None):
     month = month or get_month()
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE chat_id={p} AND month={p} ORDER BY date DESC, id DESC", (chat_id, month))
     rows = cur.fetchall(); conn.close(); return rows
 
 def add_tx(chat_id, type_, amount, desc, cat, date, added_by):
-    month = date[:7]
-    tx_id = int(datetime.now().timestamp() * 1000)
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    month = date[:7]; tx_id = int(datetime.now().timestamp()*1000)
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"INSERT INTO transactions (id,chat_id,type,amount,description,category,date,added_by,month) VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})", (tx_id,chat_id,type_,amount,desc,cat,date,added_by,month))
     conn.commit(); conn.close()
     return tx_id, date, month, type_, amount, cat, desc, added_by
 
 def del_tx(tx_id, chat_id):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"DELETE FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
     conn.commit(); conn.close()
 
-def update_tx_category(tx_id, chat_id, new_category: str):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
-    cur.execute(
-        f"UPDATE transactions SET category={p} WHERE id={p} AND chat_id={p}",
-        (new_category, tx_id, chat_id),
-    )
+def update_tx_category(tx_id, chat_id, new_cat):
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    cur.execute(f"UPDATE transactions SET category={p} WHERE id={p} AND chat_id={p}", (new_cat, tx_id, chat_id))
     conn.commit(); conn.close()
 
 def get_tx(tx_id, chat_id):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
-    cur.execute(
-        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
-        f"FROM transactions WHERE id={p} AND chat_id={p}",
-        (tx_id, chat_id),
-    )
-    row = cur.fetchone()
-    conn.close()
-    return row
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
+    row = cur.fetchone(); conn.close(); return row
 
 def get_budgets(chat_id):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"SELECT category, amount FROM budgets WHERE chat_id={p}", (chat_id,))
-    rows = cur.fetchall(); conn.close(); return {r[0]: r[1] for r in rows}
+    rows = cur.fetchall(); conn.close(); return {r[0]:r[1] for r in rows}
 
 def set_budget(chat_id, cat, amount):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
-    if db_type == "pg":
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    if t=="pg":
         cur.execute(f"INSERT INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p}) ON CONFLICT (chat_id,category) DO UPDATE SET amount={p}", (chat_id,cat,amount,amount))
     else:
         cur.execute(f"INSERT OR REPLACE INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p})", (chat_id,cat,amount))
     conn.commit(); conn.close()
 
 def get_recurring(chat_id):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"SELECT id,chat_id,amount,description,category,day_of_month FROM recurring WHERE chat_id={p}", (chat_id,))
     rows = cur.fetchall(); conn.close(); return rows
 
 def add_recurring(chat_id, amount, desc, cat, day):
-    r_id = int(datetime.now().timestamp() * 1000)
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    r_id = int(datetime.now().timestamp()*1000)
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"INSERT INTO recurring (id,chat_id,amount,description,category,day_of_month) VALUES ({p},{p},{p},{p},{p},{p})", (r_id,chat_id,amount,desc,cat,day))
     conn.commit(); conn.close()
 
 def del_recurring(r_id, chat_id):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
     cur.execute(f"DELETE FROM recurring WHERE id={p} AND chat_id={p}", (r_id, chat_id))
     conn.commit(); conn.close()
 
 def get_txs_by_date(chat_id, date_str):
-    conn, db_type = get_conn(); p = ph(db_type)
-    cur = conn.cursor()
-    cur.execute(
-        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
-        f"FROM transactions WHERE chat_id={p} AND date={p} ORDER BY id ASC",
-        (chat_id, date_str)
-    )
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE chat_id={p} AND date={p} ORDER BY id ASC", (chat_id, date_str))
     rows = cur.fetchall(); conn.close(); return rows
 
 def get_all_chats():
-    conn, db_type = get_conn()
-    cur = conn.cursor()
+    conn, _ = get_conn(); cur = conn.cursor()
     cur.execute("SELECT DISTINCT chat_id FROM transactions")
-    rows = cur.fetchall(); conn.close()
-    return [r[0] for r in rows]
+    rows = cur.fetchall(); conn.close(); return [r[0] for r in rows]
+
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 _gs_client = None
 _gs_sheet  = None
 
-SHEET_DASHBOARD = "Dashboard"
-SHEET_TX        = "Transactions"
-SHEET_BUDGET    = "Budget Tracker"
-SHEET_SUMMARY   = "Summary"
+SHEET_TX     = "Transactions"
+SHEET_BUDGET = "Budget Tracker"
+SHEET_SUM    = "Summary"
+SHEET_DASH   = "Dashboard"
 
-TX_HEADERS  = ["ID", "Date", "Month", "Type", "Amount (SGD)", "Category", "Description", "Added By", "Running Balance"]
-BUD_HEADERS = ["Category", "Monthly Budget", "Spent This Month", "Remaining", "Progress Bar", "% Used", "Status"]
-SUM_HEADERS = ["Category", "Jan Budget", "Jan Spent", "Jan %", "Feb Budget", "Feb Spent", "Feb %", "Mar Budget", "Mar Spent", "Mar %", "3-Month Avg", "Trend"]
+# Budget Tracker column layout (never change order — charts reference by column):
+# A=Category  B=Budget  C=Spent  D=Remaining  E=Progress Bar  F=%Used  G=Status
+# Chart ranges to use in Sheets:
+#   Donut (spending by cat) : Budget Tracker!A2:A10, Budget Tracker!C2:C10
+#   Bar (spent vs budget)   : Budget Tracker!A2:C10
+#   Line (3-month trend)    : Summary!A:D
+BUD_HEADERS = ["Category","Budget","Spent","Remaining","Progress","% Used","Status"]
+TX_HEADERS  = ["ID","Date","Month","Type","Amount","Category","Description","Added By"]
+SUM_HEADERS = ["Category","Jan Spent","Feb Spent","Mar Spent","3-Month Avg","Trend"]
 
-# ── colour helpers ─────────────────────────────────────────────────────────────
-_GREEN  = {"red": 0.851, "green": 0.957, "blue": 0.859}   # #D9F5DB
-_AMBER  = {"red": 0.996, "green": 0.957, "blue": 0.875}   # #FEF4DF
-_RED    = {"red": 0.988, "green": 0.910, "blue": 0.902}   # #FCE8E6
-_HEADER = {"red": 0.235, "green": 0.522, "blue": 0.282}   # #3C8548 dark green
-_WHITE  = {"red": 1.0,   "green": 1.0,   "blue": 1.0}
+_GREEN  = {"red":0.851,"green":0.957,"blue":0.859}
+_AMBER  = {"red":0.996,"green":0.957,"blue":0.875}
+_RED    = {"red":0.988,"green":0.910,"blue":0.902}
+_HEADER = {"red":0.235,"green":0.522,"blue":0.282}
+_GREY   = {"red":0.902,"green":0.902,"blue":0.902}
+_WHITE  = {"red":1.0,  "green":1.0,  "blue":1.0}
 
-def _color_cell(bg, bold=False, font_color=None, font_size=10, h_align="LEFT"):
-    fmt = {
-        "backgroundColor": bg,
-        "textFormat": {"bold": bold, "fontSize": font_size},
-        "horizontalAlignment": h_align,
-    }
-    if font_color:
-        fmt["textFormat"]["foregroundColor"] = font_color
-    return fmt
+def _sc(pct):
+    if pct>=100: return _RED
+    if pct>=80:  return _AMBER
+    return _GREEN
+
+def _st(pct):
+    if pct>=100: return "Over budget"
+    if pct>=80:  return "Warning"
+    return "OK"
+
+def _bar(pct, w=10):
+    f = max(0, min(round(pct/100*w), w))
+    return "█"*f + "░"*(w-f)
+
+def _cv(v):
+    if isinstance(v,(int,float)): return {"userEnteredValue":{"numberValue":v}}
+    return {"userEnteredValue":{"stringValue":str(v)}}
 
 def _get_gs():
     global _gs_client, _gs_sheet
-    if _gs_sheet is not None:
-        return _gs_client, _gs_sheet
-    if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
-        return None, None
+    if _gs_sheet is not None: return _gs_client, _gs_sheet
+    if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID: return None, None
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        info  = json.loads(GOOGLE_SHEETS_CREDS)
-        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        creds = Credentials.from_service_account_info(json.loads(GOOGLE_SHEETS_CREDS),
+            scopes=["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"])
         _gs_client = gspread.authorize(creds)
         _gs_sheet  = _gs_client.open_by_key(GOOGLE_SHEET_ID)
         _ensure_sheets(_gs_sheet)
@@ -231,614 +179,195 @@ def _get_gs():
         _gs_client = _gs_sheet = None
     return _gs_client, _gs_sheet
 
-def _get_or_create_ws(spreadsheet, title, headers, cols=None):
+def _get_or_create_ws(spreadsheet, title, headers):
     try:
-        ws = spreadsheet.worksheet(title)
+        return spreadsheet.worksheet(title)
     except Exception:
-        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=cols or len(headers))
-        ws.append_row(headers, value_input_option="USER_ENTERED")
-        _fmt_header_row(ws, len(headers))
-    return ws
-
-def _fmt_header_row(ws, num_cols):
-    """Bold, freeze, and colour the header row dark green with white text."""
-    try:
-        col_letter = chr(ord('A') + num_cols - 1)
-        ws.format(f"A1:{col_letter}1", {
-            "backgroundColor": _HEADER,
-            "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 10},
-            "horizontalAlignment": "CENTER",
-        })
-        ws.freeze(rows=1)
-    except Exception:
-        pass
-
-def _fmt_col_currency(ws, col_letter, start_row, end_row):
-    """Apply SGD currency format to a column range."""
-    try:
-        ws.format(f"{col_letter}{start_row}:{col_letter}{end_row}", {
-            "numberFormat": {"type": "CURRENCY", "pattern": '"$"#,##0.00'}
-        })
-    except Exception:
-        pass
-
-def _fmt_col_pct(ws, col_letter, start_row, end_row):
-    try:
-        ws.format(f"{col_letter}{start_row}:{col_letter}{end_row}", {
-            "numberFormat": {"type": "NUMBER", "pattern": "0.0\"%\""}
-        })
-    except Exception:
-        pass
-
-def _autofit_cols(ws, num_cols):
-    """Auto-resize all columns to fit content."""
-    try:
-        body = {
-            "requests": [{
-                "autoResizeDimensions": {
-                    "dimensions": {
-                        "sheetId": ws.id,
-                        "dimension": "COLUMNS",
-                        "startIndex": 0,
-                        "endIndex": num_cols,
-                    }
-                }
-            }]
-        }
-        ws.spreadsheet.batch_update(body)
-    except Exception:
-        pass
-
-def _apply_banding(ws, num_cols, num_rows):
-    """Apply alternating row colours (banding) to the data range."""
-    try:
-        col_letter = chr(ord('A') + num_cols - 1)
-        ws.spreadsheet.batch_update({"requests": [{
-            "addBanding": {
-                "bandedRange": {
-                    "range": {
-                        "sheetId": ws.id,
-                        "startRowIndex": 1,
-                        "endRowIndex": num_rows + 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_cols,
-                    },
-                    "rowProperties": {
-                        "headerColor":     _HEADER,
-                        "firstBandColor":  _WHITE,
-                        "secondBandColor": {"red": 0.973, "green": 0.984, "blue": 0.973},
-                    }
-                }
-            }
-        }]})
-    except Exception:
-        pass
-
-def _add_filter(ws, num_cols):
-    """Enable auto-filter on the header row."""
-    try:
-        ws.spreadsheet.batch_update({"requests": [{
-            "setBasicFilter": {
-                "filter": {
-                    "range": {
-                        "sheetId": ws.id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": num_cols,
-                    }
-                }
-            }
-        }]})
-    except Exception:
-        pass
-
-def _status_color(pct):
-    if pct >= 100: return _RED
-    if pct >= 80:  return _AMBER
-    return _GREEN
-
-def _status_text(pct):
-    if pct >= 100: return "Over budget"
-    if pct >= 80:  return "Warning"
-    return "OK"
-
-def _progress_bar_str(pct, width=10):
-    filled = max(0, min(round(pct / 100 * width), width))
-    return "█" * filled + "░" * (width - filled)
+        ws = spreadsheet.add_worksheet(title=title, rows=1000, cols=max(len(headers),10))
+        if headers: ws.append_row(headers, value_input_option="USER_ENTERED")
+        return ws
 
 def _ensure_sheets(spreadsheet):
-    _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=10)
-    _get_or_create_ws(spreadsheet, SHEET_TX,        TX_HEADERS)
-    _get_or_create_ws(spreadsheet, SHEET_BUDGET,    BUD_HEADERS)
-    _get_or_create_ws(spreadsheet, SHEET_SUMMARY,   SUM_HEADERS)
-    try:
-        default = spreadsheet.worksheet("Sheet1")
-        spreadsheet.del_worksheet(default)
-    except Exception:
-        pass
+    for title, headers in [(SHEET_DASH,[]),(SHEET_TX,TX_HEADERS),(SHEET_BUDGET,BUD_HEADERS),(SHEET_SUM,SUM_HEADERS)]:
+        _get_or_create_ws(spreadsheet, title, headers)
+    try: spreadsheet.del_worksheet(spreadsheet.worksheet("Sheet1"))
+    except Exception: pass
 
-# ── Transactions sheet ────────────────────────────────────────────────────────
+
+def gs_refresh_budget(spreadsheet, chat_id, month):
+    """
+    Writes Budget Tracker with ALL 9 categories in fixed order.
+    Layout (chart-stable):
+      Row 1  : Header
+      Rows 2-10 : One row per category (always all 9, even if $0 spent)
+      Row 11 : Blank spacer (keeps TOTAL out of chart range A2:C10)
+      Row 12 : TOTAL row
+    Your chart ranges to set in Sheets:
+      Donut  -> A2:A10, C2:C10
+      Bar    -> A2:C10
+    """
+    budgets      = get_budgets(chat_id)
+    _, _, by_cat = calc_summary(chat_id, month)
+    ws           = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
+    sid          = ws.id
+    n = len(CATS)  # always 9
+
+    data_rows  = []
+    row_colors = []
+    for cat in CATS:
+        bud   = budgets.get(cat, 0)
+        spent = round(by_cat.get(cat, 0), 2)
+        rem   = round(bud-spent, 2) if bud else ""
+        pct   = round(spent/bud*100, 1) if bud else 0
+        bar   = _bar(pct) if bud else ""
+        status = _st(pct) if bud else "—"
+        data_rows.append([cat, bud or 0, spent, rem, bar, pct if bud else "", status])
+        row_colors.append(_sc(pct) if bud else _WHITE)
+
+    total_bud   = sum(budgets.get(c,0) for c in CATS)
+    total_spent = round(sum(by_cat.get(c,0) for c in CATS), 2)
+    total_rem   = round(total_bud-total_spent, 2)
+    total_pct   = round(total_spent/total_bud*100,1) if total_bud else 0
+    total_row   = ["TOTAL", total_bud, total_spent, total_rem, _bar(total_pct), total_pct if total_bud else "", _st(total_pct) if total_bud else "—"]
+    spacer_row  = [""]*7
+
+    all_rows = [BUD_HEADERS] + data_rows + [spacer_row] + [total_row]
+    cell_data = [{"values":[_cv(v) for v in r]} for r in all_rows]
+
+    reqs = [
+        {"updateCells":{"range":{"sheetId":sid,"startRowIndex":0,"endRowIndex":500,"startColumnIndex":0,"endColumnIndex":7},"fields":"userEnteredValue,userEnteredFormat"}},
+        {"updateCells":{"rows":cell_data,"fields":"userEnteredValue","start":{"sheetId":sid,"rowIndex":0,"columnIndex":0}}},
+        {"repeatCell":{"range":{"sheetId":sid,"startRowIndex":0,"endRowIndex":1,"startColumnIndex":0,"endColumnIndex":7},"cell":{"userEnteredFormat":{"backgroundColor":_HEADER,"textFormat":{"bold":True,"foregroundColor":_WHITE,"fontSize":10},"horizontalAlignment":"CENTER"}},"fields":"userEnteredFormat"}},
+        {"repeatCell":{"range":{"sheetId":sid,"startRowIndex":n+2,"endRowIndex":n+3,"startColumnIndex":0,"endColumnIndex":7},"cell":{"userEnteredFormat":{"backgroundColor":_GREY,"textFormat":{"bold":True}}},"fields":"userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold"}},
+        {"updateSheetProperties":{"properties":{"sheetId":sid,"gridProperties":{"frozenRowCount":1}},"fields":"gridProperties.frozenRowCount"}},
+        {"autoResizeDimensions":{"dimensions":{"sheetId":sid,"dimension":"COLUMNS","startIndex":0,"endIndex":7}}},
+    ]
+    for col in [1,2,3]:
+        reqs.append({"repeatCell":{"range":{"sheetId":sid,"startRowIndex":1,"endRowIndex":n+3,"startColumnIndex":col,"endColumnIndex":col+1},"cell":{"userEnteredFormat":{"numberFormat":{"type":"CURRENCY","pattern":"\"$\"#,##0.00"}}},"fields":"userEnteredFormat.numberFormat"}})
+    reqs.append({"repeatCell":{"range":{"sheetId":sid,"startRowIndex":1,"endRowIndex":n+3,"startColumnIndex":5,"endColumnIndex":6},"cell":{"userEnteredFormat":{"numberFormat":{"type":"NUMBER","pattern":"0.0\"%\""}}},"fields":"userEnteredFormat.numberFormat"}})
+    for i, color in enumerate(row_colors):
+        reqs.append({"repeatCell":{"range":{"sheetId":sid,"startRowIndex":i+1,"endRowIndex":i+2,"startColumnIndex":0,"endColumnIndex":7},"cell":{"userEnteredFormat":{"backgroundColor":color}},"fields":"userEnteredFormat.backgroundColor"}})
+    spreadsheet.batch_update({"requests":reqs})
+
+
+def gs_refresh_summary(spreadsheet, chat_id):
+    """Summary sheet: categories as rows, last 3 months as columns.
+    Point your line chart at Summary!A:D for the 3-month trend."""
+    month   = get_month()
+    dt      = datetime.strptime(month, "%Y-%m")
+    months  = [(dt-timedelta(days=30*i)).strftime("%Y-%m") for i in range(2,-1,-1)]
+    ws = _get_or_create_ws(spreadsheet, SHEET_SUM, SUM_HEADERS)
+    ws.clear()
+    month_labels = [datetime.strptime(m,"%Y-%m").strftime("%b %Y") for m in months]
+    headers = ["Category"] + [f"{l} Spent" for l in month_labels] + ["3-Month Avg","Trend"]
+    ws.append_row(headers, value_input_option="USER_ENTERED")
+    rows = []
+    for cat in CATS:
+        spends = [round(calc_summary(chat_id,m)[2].get(cat,0),2) for m in months]
+        avg    = round(sum(spends)/3, 2)
+        if   spends[-1]>spends[0]: trend="\u25b2 Increasing"
+        elif spends[-1]<spends[0]: trend="\u25bc Decreasing"
+        elif all(s==0 for s in spends): trend="\u2014"
+        else: trend="\u2192 Stable"
+        rows.append([cat]+spends+[avg,trend])
+    if rows: ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+def gs_refresh_dashboard(spreadsheet, chat_id):
+    month        = get_month()
+    budgets      = get_budgets(chat_id)
+    income, spent, by_cat = calc_summary(chat_id, month)
+    last_month   = (datetime.now().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
+    _, last_spent, _ = calc_summary(chat_id, last_month)
+    total_budget = sum(budgets.values())
+    remaining    = income-spent
+    savings_rate = round(remaining/income*100,1) if income>0 else 0
+    budget_pct   = round(spent/total_budget*100,1) if total_budget else 0
+    mom_diff     = round(spent-last_spent,2)
+    mom_arrow    = "\u25b2" if mom_diff>0 else "\u25bc"
+    updated_at   = datetime.now().strftime("%d %b %Y %H:%M")
+    ws = _get_or_create_ws(spreadsheet, SHEET_DASH, [])
+    sid = ws.id
+    rows = [
+        [f"Family Budget Dashboard \u2014 {month_label(month)}","","","","",f"Updated: {updated_at}"],
+        [""],
+        ["MONTHLY OVERVIEW","","","","",""],
+        ["Income",f"${income:,.2f}","Spent",f"${spent:,.2f}","Remaining",f"${remaining:,.2f}"],
+        ["Savings rate",f"{savings_rate}%","Budget used",f"{budget_pct}%","vs Last Month",f"{mom_arrow} ${abs(mom_diff):,.2f}"],
+        [""],["TOP 3 SPENDING","","","","",""],
+    ]
+    for cat, amt in sorted(by_cat.items(), key=lambda x:-x[1])[:3]:
+        rows.append([f"{CAT_ICONS.get(cat,chr(8226))} {cat}",f"${amt:,.2f}","","","",""])
+    cell_rows = [{"values":[_cv(v) for v in r]} for r in rows]
+    spreadsheet.batch_update({"requests":[
+        {"updateCells":{"range":{"sheetId":sid,"startRowIndex":0,"endRowIndex":200,"startColumnIndex":0,"endColumnIndex":8},"fields":"userEnteredValue,userEnteredFormat"}},
+        {"updateCells":{"rows":cell_rows,"fields":"userEnteredValue","start":{"sheetId":sid,"rowIndex":0,"columnIndex":0}}},
+        {"repeatCell":{"range":{"sheetId":sid,"startRowIndex":0,"endRowIndex":1,"startColumnIndex":0,"endColumnIndex":6},"cell":{"userEnteredFormat":{"backgroundColor":_HEADER,"textFormat":{"bold":True,"foregroundColor":_WHITE,"fontSize":12}}},"fields":"userEnteredFormat"}},
+        {"autoResizeDimensions":{"dimensions":{"sheetId":sid,"dimension":"COLUMNS","startIndex":0,"endIndex":6}}},
+    ]})
+
 def gs_append_tx(tx_id, date, month, type_, amount, cat, desc, added_by):
     _, spreadsheet = _get_gs()
-    if not spreadsheet:
-        return
+    if not spreadsheet: return
     try:
         ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
-        all_vals = ws.get_all_values()
-        next_row = len(all_vals) + 1
-
-        sign = 1 if type_ == "income" else -1
-        if next_row == 2:
-            running_bal_formula = f"=E2"
-        else:
-            running_bal_formula = f"=I{next_row - 1}+IF(D{next_row}=\"income\",E{next_row},-E{next_row})"
-
-        ws.append_row(
-            [str(tx_id), date, month, type_, amount, cat, desc, added_by, running_bal_formula],
-            value_input_option="USER_ENTERED"
-        )
-        _fmt_col_currency(ws, "E", next_row, next_row)
-        _fmt_col_currency(ws, "I", next_row, next_row)
-
-        income_color = {"red": 0.851, "green": 0.957, "blue": 0.859}
-        expense_color = {"red": 0.988, "green": 0.910, "blue": 0.902}
-        ws.format(f"D{next_row}", {
-            "backgroundColor": income_color if type_ == "income" else expense_color,
-            "textFormat": {"bold": True, "fontSize": 10},
-            "horizontalAlignment": "CENTER",
-        })
-        _autofit_cols(ws, len(TX_HEADERS))
-    except Exception as e:
-        print(f"gs_append_tx error: {e}")
+        ws.append_row([str(tx_id),date,month,type_,amount,cat,desc,added_by], value_input_option="USER_ENTERED")
+    except Exception as e: print(f"gs_append_tx error: {e}")
 
 def gs_delete_tx(tx_id):
     _, spreadsheet = _get_gs()
-    if not spreadsheet:
-        return
+    if not spreadsheet: return
     try:
-        ws   = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
         cell = ws.find(str(tx_id), in_column=1)
-        if cell:
-            ws.delete_rows(cell.row)
-    except Exception as e:
-        print(f"gs_delete_tx error: {e}")
+        if cell: ws.delete_rows(cell.row)
+    except Exception as e: print(f"gs_delete_tx error: {e}")
 
-def gs_update_tx_category(tx_id, new_category):
+def gs_update_tx_category(tx_id, new_cat):
     _, spreadsheet = _get_gs()
-    if not spreadsheet:
-        return
+    if not spreadsheet: return
     try:
-        ws   = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
+        ws = _get_or_create_ws(spreadsheet, SHEET_TX, TX_HEADERS)
         cell = ws.find(str(tx_id), in_column=1)
-        if cell:
-            ws.update_cell(cell.row, 6, new_category)
-    except Exception as e:
-        print(f"gs_update_tx_category error: {e}")
+        if cell: ws.update_cell(cell.row, 6, new_cat)
+    except Exception as e: print(f"gs_update_tx_category error: {e}")
 
-# ── Budget Tracker sheet ──────────────────────────────────────────────────────
-def _refresh_budget_sheet(spreadsheet, chat_id, month):
-    budgets     = get_budgets(chat_id)
-    _, _, by_cat = calc_summary(chat_id, month)
-
-    ws = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
-    bud_rows  = []
-    row_colors = []
-
-    for cat in CATS:
-        spent = by_cat.get(cat, 0)
-        bud   = budgets.get(cat, 0)
-        if not spent and not bud:
-            continue
-        remaining = round(bud - spent, 2) if bud else ""
-        pct       = round(spent / bud * 100, 1) if bud else 0
-        bar       = _progress_bar_str(pct) if bud else ""
-        status    = _status_text(pct) if bud else "No budget set"
-        bud_rows.append([cat, bud or "", round(spent, 2), remaining, bar, pct if bud else "", status])
-        row_colors.append(_status_color(pct) if bud else _WHITE)
-
-    if not bud_rows:
-        return
-
-    total_bud   = sum(budgets.get(c, 0) for c in CATS)
-    total_spent = sum(by_cat.get(c, 0) for c in CATS if budgets.get(c, 0))
-    total_rem   = round(total_bud - total_spent, 2)
-    total_pct   = round(total_spent / total_bud * 100, 1) if total_bud else 0
-    bud_rows.append(["TOTAL", total_bud, round(total_spent, 2), total_rem, _progress_bar_str(total_pct), total_pct, _status_text(total_pct)])
-    row_colors.append(_WHITE)
-
-    # Write header + all data rows in one updateCells call
-    def _cv(v):
-        if isinstance(v, (int, float)): return {"userEnteredValue": {"numberValue": v}}
-        return {"userEnteredValue": {"stringValue": str(v)}}
-    all_rows = [BUD_HEADERS] + bud_rows
-    cell_rows_data = [{"values": [_cv(v) for v in r]} for r in all_rows]
-
-    data_end = len(bud_rows) + 1
-    _fmt_col_currency(ws, "B", 2, data_end)
-    _fmt_col_currency(ws, "C", 2, data_end)
-    _fmt_col_currency(ws, "D", 2, data_end)
-    _fmt_col_pct(ws, "F", 2, data_end)
-
-    requests = []
-    for i, color in enumerate(row_colors):
-        row_idx = i + 1
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": row_idx,
-                    "endRowIndex": row_idx + 1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(BUD_HEADERS),
-                },
-                "cell": {"userEnteredFormat": {"backgroundColor": color}},
-                "fields": "userEnteredFormat.backgroundColor",
-            }
-        })
-
-    if row_colors:
-        last_row_idx = len(row_colors)
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": ws.id,
-                    "startRowIndex": last_row_idx,
-                    "endRowIndex": last_row_idx + 1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": len(BUD_HEADERS),
-                },
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 0.902, "green": 0.902, "blue": 0.902},
-                    "textFormat": {"bold": True},
-                }},
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.bold",
-            }
-        })
-
-    # Single batch_update: clear + write data + all formatting
-    col_fmt_requests = []
-    sheet_id = ws.id
-    def _currency_req(col_idx, r1, r2):
-        return {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
-                      "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
-            "cell": {"userEnteredFormat": {"numberFormat": {"type": "CURRENCY", "pattern": '"$"#,##0.00'}}},
-            "fields": "userEnteredFormat.numberFormat"
-        }}
-    def _pct_req(col_idx, r1, r2):
-        return {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
-                      "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
-            "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": '0.0"%"'}}},
-            "fields": "userEnteredFormat.numberFormat"
-        }}
-
-    r2 = data_end
-    col_fmt_requests += [
-        _currency_req(1, 1, r2),  # col B
-        _currency_req(2, 1, r2),  # col C
-        _currency_req(3, 1, r2),  # col D
-        _pct_req(5, 1, r2),       # col F
-        {"setBasicFilter": {"filter": {"range": {
-            "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-            "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)
-        }}}},
-        {"autoResizeDimensions": {"dimensions": {
-            "sheetId": sheet_id, "dimension": "COLUMNS",
-            "startIndex": 0, "endIndex": len(BUD_HEADERS)
-        }}},
-    ]
-
-    all_requests = [
-        # Clear sheet first
-        {"updateCells": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
-                      "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)},
-            "fields": "userEnteredValue,userEnteredFormat",
-        }},
-        # Write header + data
-        {"updateCells": {
-            "rows": cell_rows_data,
-            "fields": "userEnteredValue",
-            "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
-        }},
-        # Header formatting
-        {"repeatCell": {
-            "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                      "startColumnIndex": 0, "endColumnIndex": len(BUD_HEADERS)},
-            "cell": {"userEnteredFormat": {
-                "backgroundColor": _HEADER,
-                "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 10},
-                "horizontalAlignment": "CENTER",
-            }},
-            "fields": "userEnteredFormat",
-        }},
-    ] + requests + col_fmt_requests
-    if all_requests:
-        spreadsheet.batch_update({"requests": all_requests})
-
-# ── Summary sheet ─────────────────────────────────────────────────────────────
-def _refresh_summary_sheet(spreadsheet, chat_id):
-    month    = get_month()
-    budgets  = get_budgets(chat_id)
-    dt       = datetime.strptime(month, "%Y-%m")
-    months   = [(dt - timedelta(days=30 * i)).strftime("%Y-%m") for i in range(2, -1, -1)]
-
-    ws = _get_or_create_ws(spreadsheet, SHEET_SUMMARY, SUM_HEADERS)
-    ws.clear()
-
-    month_labels = [datetime.strptime(m, "%Y-%m").strftime("%b %Y") for m in months]
-    headers = ["Category"]
-    for lbl in month_labels:
-        headers += [f"{lbl} Budget", f"{lbl} Spent", f"{lbl} %"]
-    headers += ["3-Month Avg", "Trend"]
-    ws.append_row(headers, value_input_option="USER_ENTERED")
-    _fmt_header_row(ws, len(headers))
-
-    by_cat_per_month = [calc_summary(chat_id, m)[2] for m in months]
-    sum_rows   = []
-    row_colors = []
-
-    for cat in CATS:
-        row   = [cat]
-        spends = []
-        for i, m in enumerate(months):
-            bud   = budgets.get(cat, 0)
-            spent = round(by_cat_per_month[i].get(cat, 0), 2)
-            pct   = round(spent / bud * 100, 1) if bud else ""
-            row  += [bud or "", spent, pct]
-            spends.append(spent)
-        avg = round(sum(spends) / len(spends), 2) if any(spends) else 0
-        if spends[0] == 0 and spends[-1] == 0:
-            trend = "—"
-        elif spends[-1] > spends[0]:
-            trend = "▲ Increasing"
-        elif spends[-1] < spends[0]:
-            trend = "▼ Decreasing"
-        else:
-            trend = "→ Stable"
-        row += [avg, trend]
-        if any(spends) or budgets.get(cat, 0):
-            latest_pct = round(spends[-1] / budgets[cat] * 100, 1) if budgets.get(cat, 0) else 0
-            sum_rows.append(row)
-            row_colors.append(_status_color(latest_pct) if budgets.get(cat, 0) else _WHITE)
-
-    if sum_rows:
-        ws.append_rows(sum_rows, value_input_option="USER_ENTERED")
-        data_end = len(sum_rows) + 1
-        for col in ["B", "C", "E", "F", "H", "I", "K"]:
-            _fmt_col_currency(ws, col, 2, data_end)
-        for col in ["D", "G", "J"]:
-            _fmt_col_pct(ws, col, 2, data_end)
-
-        requests = []
-        for i, color in enumerate(row_colors):
-            row_idx = i + 1
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": ws.id,
-                        "startRowIndex": row_idx,
-                        "endRowIndex": row_idx + 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": len(headers),
-                    },
-                    "cell": {"userEnteredFormat": {"backgroundColor": color}},
-                    "fields": "userEnteredFormat.backgroundColor",
-                }
-            })
-        # Merge row colours + filter + autofit into one batch_update
-        sheet_id = ws.id
-        extra = [
-            {"setBasicFilter": {"filter": {"range": {
-                "sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                "startColumnIndex": 0, "endColumnIndex": len(headers)
-            }}}},
-            {"autoResizeDimensions": {"dimensions": {
-                "sheetId": sheet_id, "dimension": "COLUMNS",
-                "startIndex": 0, "endIndex": len(headers)
-            }}},
-        ]
-
-        # Also consolidate currency/pct formatting inline
-        def _cr(col_idx, r1, r2, fmt_type, pattern):
-            return {"repeatCell": {
-                "range": {"sheetId": sheet_id, "startRowIndex": r1, "endRowIndex": r2,
-                          "startColumnIndex": col_idx, "endColumnIndex": col_idx + 1},
-                "cell": {"userEnteredFormat": {"numberFormat": {"type": fmt_type, "pattern": pattern}}},
-                "fields": "userEnteredFormat.numberFormat"
-            }}
-        cur_cols = [1, 2, 4, 5, 7, 8, 10]   # B,C,E,F,H,I,K
-        pct_cols = [3, 6, 9]                  # D,G,J
-        for c in cur_cols:
-            extra.append(_cr(c, 1, data_end, "CURRENCY", '"$"#,##0.00'))
-        for c in pct_cols:
-            extra.append(_cr(c, 1, data_end, "NUMBER", '0.0"%"'))
-
-        all_reqs = requests + extra
-        if all_reqs:
-            spreadsheet.batch_update({"requests": all_reqs})
-
-# ── Dashboard sheet ───────────────────────────────────────────────────────────
-def _refresh_dashboard(spreadsheet, chat_id):
-    """Write dashboard data only."""
-    month   = get_month()
-    budgets = get_budgets(chat_id)
-    income, spent, by_cat = calc_summary(chat_id, month)
-    last_month       = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    _, last_spent, _ = calc_summary(chat_id, last_month)
-    total_budget  = sum(budgets.values())
-    remaining     = income - spent
-    savings_rate  = round(remaining / income * 100, 1) if income > 0 else 0
-    budget_pct    = round(spent / total_budget * 100, 1) if total_budget else 0
-    mom_diff      = round(spent - last_spent, 2)
-    mom_arrow     = "▲" if mom_diff > 0 else "▼"
-    updated_at    = datetime.now().strftime("%d %b %Y %H:%M")
-
-    try:
-        ws = _get_or_create_ws(spreadsheet, SHEET_DASHBOARD, [], cols=8)
-        sheet_id = ws.id
-
-        rows = [
-            [f"Family Budget Dashboard — {month_label(month)}", "", "", "", "", f"Updated: {updated_at}"],
-            [""],
-            ["MONTHLY OVERVIEW", "", "", "", "", ""],
-            ["Income", f"${income:,.2f}", "Spent", f"${spent:,.2f}", "Remaining", f"${remaining:,.2f}"],
-            ["Savings rate", f"{savings_rate}%", "Budget used", f"{budget_pct}%", "vs Last Month", f"{mom_arrow} ${abs(mom_diff):,.2f}"],
-            [""],
-            ["CATEGORY BREAKDOWN", "", "", "", "", ""],
-            ["Category", "Budget", "Spent", "Remaining", "Progress", "Status"],
-        ]
-        active_cats = [c for c in CATS if by_cat.get(c, 0) or budgets.get(c, 0)]
-        for cat in active_cats:
-            bud    = budgets.get(cat, 0)
-            s      = round(by_cat.get(cat, 0), 2)
-            rem    = round(bud - s, 2) if bud else ""
-            pct    = round(s / bud * 100, 1) if bud else 0
-            bar    = _progress_bar_str(pct) if bud else ""
-            status = _status_text(pct) if bud else "—"
-            rows.append([cat, bud or "", s, rem, bar, status])
-        rows += [[""], ["TOP 3 SPENDING CATEGORIES", "", "", "", "", ""]]
-        for cat, amt in sorted(by_cat.items(), key=lambda x: -x[1])[:3]:
-            rows.append([cat, f"${amt:,.2f}", "", "", "", ""])
-
-        def _cv(v):
-            if isinstance(v, (int, float)): return {"userEnteredValue": {"numberValue": v}}
-            return {"userEnteredValue": {"stringValue": str(v)}}
-
-        cell_rows = [{"values": [_cv(v) for v in r]} for r in rows]
-
-        fmt_reqs = [
-            {"updateCells": {
-                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 500,
-                          "startColumnIndex": 0, "endColumnIndex": 8},
-                "fields": "userEnteredValue,userEnteredFormat",
-            }},
-            {"updateCells": {
-                "rows": cell_rows, "fields": "userEnteredValue",
-                "start": {"sheetId": sheet_id, "rowIndex": 0, "columnIndex": 0},
-            }},
-            {"repeatCell": {
-                "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
-                          "startColumnIndex": 0, "endColumnIndex": 6},
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": _HEADER,
-                    "textFormat": {"bold": True, "foregroundColor": _WHITE, "fontSize": 12},
-                }},
-                "fields": "userEnteredFormat",
-            }},
-            {"repeatCell": {
-                "range": {"sheetId": sheet_id, "startRowIndex": 7, "endRowIndex": 8,
-                          "startColumnIndex": 0, "endColumnIndex": 6},
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": {"red": 0.902, "green": 0.902, "blue": 0.902},
-                    "textFormat": {"bold": True},
-                }},
-                "fields": "userEnteredFormat",
-            }},
-            {"autoResizeDimensions": {"dimensions": {
-                "sheetId": sheet_id, "dimension": "COLUMNS",
-                "startIndex": 0, "endIndex": 6,
-            }}},
-        ]
-        for i, cat in enumerate(active_cats):
-            bud   = budgets.get(cat, 0)
-            s     = by_cat.get(cat, 0)
-            pct   = round(s / bud * 100, 1) if bud else 0
-            color = _status_color(pct) if bud else _WHITE
-            fmt_reqs.append({"repeatCell": {
-                "range": {"sheetId": sheet_id, "startRowIndex": 8 + i, "endRowIndex": 9 + i,
-                          "startColumnIndex": 0, "endColumnIndex": 6},
-                "cell": {"userEnteredFormat": {"backgroundColor": color}},
-                "fields": "userEnteredFormat.backgroundColor",
-            }})
-        spreadsheet.batch_update({"requests": fmt_reqs})
-    except Exception as e:
-        print(f"_refresh_dashboard error: {e}")
-
-# ── Master refresh ────────────────────────────────────────────────────────────
-def _sheets_call(fn, *args, retries=4, **kwargs):
-    """
-    Call a Google Sheets API function with exponential backoff on 429 / 503.
-    Waits 15s, 30s, 60s, 120s before giving up.
-    """
-    import time
-    delays = [15, 30, 60, 120]
-    for attempt, delay in enumerate(delays):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "503" in msg or "Quota" in msg or "quota" in msg:
-                if attempt < len(delays) - 1:
-                    print(f"[SHEETS] Rate limited, retrying in {delay}s... ({msg[:80]})")
-                    time.sleep(delay)
-                    continue
-            raise  # non-quota error — re-raise immediately
-    raise RuntimeError("Sheets API quota exceeded after all retries")
-
-
-def gs_refresh_summary(chat_id):
-    import time
+def gs_refresh_all(chat_id):
     _, spreadsheet = _get_gs()
-    if not spreadsheet:
-        return
+    if not spreadsheet: return
     month = get_month()
+    for label, fn, args in [
+        ("Budget Tracker", gs_refresh_budget,   (spreadsheet, chat_id, month)),
+        ("Summary",        gs_refresh_summary,  (spreadsheet, chat_id)),
+        ("Dashboard",      gs_refresh_dashboard,(spreadsheet, chat_id)),
+    ]:
+        try: fn(*args); print(f"{label} OK")
+        except Exception as e: print(f"{label} error: {e}")
+        time.sleep(3)
 
-    # Run each tab refresh through the retry wrapper.
-    # Sleep 5s between tabs to spread writes across time.
-    try:
-        _sheets_call(_refresh_budget_sheet, spreadsheet, chat_id, month)
-        print("Budget sheet OK")
-    except Exception as e:
-        print(f"Budget sheet error: {e}")
-
-    time.sleep(5)
-
-    try:
-        _sheets_call(_refresh_summary_sheet, spreadsheet, chat_id)
-        print("Summary sheet OK")
-    except Exception as e:
-        print(f"Summary sheet error: {e}")
-
-    time.sleep(5)
-
-    try:
-        _sheets_call(_refresh_dashboard, spreadsheet, chat_id)
-        print("Dashboard OK")
-    except Exception as e:
-        print(f"Dashboard error: {e}")
-
-async def gs_sync_async(chat_id, tx_id=None, date=None, month=None,
-                        type_=None, amount=None, cat=None, desc=None,
-                        added_by=None, delete=False, update_category=False):
+async def gs_sync_async(chat_id, tx_id=None, date=None, month=None, type_=None, amount=None, cat=None, desc=None, added_by=None, delete=False, update_category=False):
     loop = asyncio.get_event_loop()
     if delete and tx_id:
         await loop.run_in_executor(None, gs_delete_tx, tx_id)
     elif update_category and tx_id and cat:
         await loop.run_in_executor(None, gs_update_tx_category, tx_id, cat)
     elif tx_id:
-        await loop.run_in_executor(None, gs_append_tx,
-                                   tx_id, date, month, type_,
-                                   amount, cat, desc, added_by)
-    await loop.run_in_executor(None, gs_refresh_summary, chat_id)
+        await loop.run_in_executor(None, gs_append_tx, tx_id, date, month, type_, amount, cat, desc, added_by)
+    await loop.run_in_executor(None, gs_refresh_all, chat_id)
 
 
 def fmt(n): return f"${n:,.2f}"
-def fmt_short(n): return f"${n:,.0f}" if n == int(n) else f"${n:,.2f}"
 def get_month(): return datetime.now().strftime("%Y-%m")
 def month_label(m=None):
     m = m or get_month()
-    return datetime.strptime(m, "%Y-%m").strftime("%B %Y")
+    return datetime.strptime(m,"%Y-%m").strftime("%B %Y")
 
 def calc_summary(chat_id, month=None):
-    txs = get_txs(chat_id, month)
+    txs    = get_txs(chat_id, month)
     income = sum(t[3] for t in txs if t[2]=="income")
     spent  = sum(t[3] for t in txs if t[2]=="expense")
     by_cat = {}
     for t in txs:
-        if t[2]=="expense": by_cat[t[5]] = by_cat.get(t[5],0) + t[3]
+        if t[2]=="expense": by_cat[t[5]] = by_cat.get(t[5],0)+t[3]
     return income, spent, by_cat
 
 def progress_bar(pct, width=10):
@@ -846,946 +375,600 @@ def progress_bar(pct, width=10):
     return "█"*filled + "░"*(width-filled)
 
 def budget_status(pct):
-    if pct >= 100: return "🔴"
-    if pct >= 80:  return "🟡"
+    if pct>=100: return "🔴"
+    if pct>=80:  return "🟡"
     return "🟢"
 
 def guess_category(text):
-    """Guess category from description keywords."""
-    text_lower = text.lower()
-    for cat_obj in CATEGORIES:
-        if any(kw in text_lower for kw in cat_obj.keywords):
-            return cat_obj.name
+    tl = text.lower()
+    for cat, kws in CAT_KEYWORDS.items():
+        if any(kw in tl for kw in kws): return cat
     return None
 
 def get_grade(pct_used):
-    if pct_used <= 0.7:  return "A", "🌟 Excellent!"
-    if pct_used <= 0.85: return "B", "👍 Good job!"
-    if pct_used <= 0.95: return "C", "😐 Watch your spending"
-    if pct_used <= 1.0:  return "D", "⚠️ Almost over budget!"
-    return "F", "🔴 Over budget!"
+    if pct_used<=0.7:  return "A","🌟 Excellent!"
+    if pct_used<=0.85: return "B","👍 Good job!"
+    if pct_used<=0.95: return "C","😐 Watch your spending"
+    if pct_used<=1.0:  return "D","⚠️ Almost over budget!"
+    return "F","🔴 Over budget!"
 
-# ── REPLY KEYBOARD ───────────────────────────────────────────────────────────
 def main_keyboard():
     keyboard = [
-        [KeyboardButton("📊 Summary"), KeyboardButton("📋 Spent")],
-        [KeyboardButton("🏆 Report"), KeyboardButton("🧾 Recent")],
-        [KeyboardButton("💰 Budgets"), KeyboardButton("🗑 Delete")],
-        [KeyboardButton("🔁 Recurring"), KeyboardButton("❓ Help")],
+        [KeyboardButton("📊 Summary"),  KeyboardButton("📋 Spent")],
+        [KeyboardButton("🏆 Report"),   KeyboardButton("🧾 Recent")],
+        [KeyboardButton("👫 Who"),      KeyboardButton("💰 Budgets")],
+        [KeyboardButton("🔁 Recurring"),KeyboardButton("🗑 Delete")],
+        [KeyboardButton("❓ Help"),     KeyboardButton("🔄 Sheets")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
 
-# ── RECEIPT SCANNER ──────────────────────────────────────────────────────────
+
 async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
-    if not ANTHROPIC_API_KEY:
-        return {"error": "ANTHROPIC_API_KEY not configured"}
-
+    if not ANTHROPIC_API_KEY: return {"error": "ANTHROPIC_API_KEY not configured"}
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    if image_bytes[:4] == b'\x89PNG':
-        media_type = "image/png"
-    elif image_bytes[:2] == b'\xff\xd8':
-        media_type = "image/jpeg"
-    elif image_bytes[:4] == b'RIFF':
-        media_type = "image/webp"
-    else:
-        media_type = "image/jpeg"
-    print(f"Detected media type: {media_type}, size: {len(image_bytes)}")
-
-    # Build valid category list dynamically from CATEGORIES
-    valid_categories = ", ".join(c.name for c in CATEGORIES)
-
-    payload = {
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 1024,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": f"""Analyze this receipt image and extract the following information.
-Reply ONLY with a JSON object, no other text:
-{{
-  "merchant": "store/restaurant name",
-  "total": 12.34,
-  "date": "YYYY-MM-DD or null if not visible",
-  "category": "one of: {valid_categories}",
-  "items": ["item1 $x.xx", "item2 $x.xx"],
-  "confidence": "high/medium/low"
-}}
-
-If you cannot read the receipt clearly, return:
-{{"error": "Cannot read receipt clearly"}}"""
-                    }
-                ],
-            }
-        ],
-    }
-
+    if image_bytes[:4]==b'\x89PNG': mt="image/png"
+    elif image_bytes[:2]==b'\xff\xd8': mt="image/jpeg"
+    elif image_bytes[:4]==b'RIFF': mt="image/webp"
+    else: mt="image/jpeg"
+    valid_cats = ", ".join(CATS)
+    payload = {"model":"claude-sonnet-4-6","max_tokens":1024,"messages":[{"role":"user","content":[
+        {"type":"image","source":{"type":"base64","media_type":mt,"data":image_b64}},
+        {"type":"text","text":f"""Analyze this receipt. Reply ONLY with JSON:
+{{"merchant":"name","total":12.34,"date":"YYYY-MM-DD or null","category":"one of: {valid_cats}","items":["item $x"],"confidence":"high/medium/low"}}
+If unreadable: {{"error":"Cannot read receipt clearly"}}"""}
+    ]}]}
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-        if response.status_code != 200:
-            print(f"Anthropic API error {response.status_code}: {response.text}")
-            return {"error": f"API error {response.status_code}: {response.text[:200]}"}
-        data = response.json()
-        text = data["content"][0]["text"].strip()
-        text = text.replace("```json", "").replace("```", "").strip()
+        r = await client.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+            json=payload)
+        if r.status_code!=200: return {"error":f"API error {r.status_code}"}
+        text = r.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
         return json.loads(text)
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    added_by = update.effective_user.first_name or "Someone"
-
+    chat_id=str(update.effective_chat.id); added_by=update.effective_user.first_name or "Someone"
     if not ANTHROPIC_API_KEY:
-        await update.message.reply_text(
-            "⚠️ Receipt scanning not configured yet.\nAsk Jonathan to add the ANTHROPIC_API_KEY!",
-            parse_mode="Markdown"
-        )
-        return
-
-    scanning_msg = await update.message.reply_text("📸 Scanning receipt... give me a sec! ⏳")
-
+        await update.message.reply_text("⚠️ Receipt scanning not configured."); return
+    scanning_msg = await update.message.reply_text("📸 Scanning receipt... ⏳")
     try:
-        photo = update.message.photo[-1]
-        photo_file = await ctx.bot.get_file(photo.file_id)
-        image_bytes = await photo_file.download_as_bytearray()
-        image_bytes = bytes(image_bytes)
-
-        print(f"Downloaded image: {len(image_bytes)} bytes")
-
-        if len(image_bytes) < 1000:
-            raise Exception(f"Downloaded image too small ({len(image_bytes)} bytes)")
-
-        result = await scan_receipt_with_claude(image_bytes)
-
+        photo=update.message.photo[-1]; pf=await ctx.bot.get_file(photo.file_id)
+        image_bytes=bytes(await pf.download_as_bytearray())
+        if len(image_bytes)<1000: raise Exception("Image too small")
+        result=await scan_receipt_with_claude(image_bytes)
         if "error" in result:
-            await scanning_msg.edit_text(
-                f"😕 *Couldn't read that receipt*\n\n_{result['error']}_\n\nTry a clearer photo or use:\n`amount description`",
-                parse_mode="Markdown"
-            )
-            return
-
-        merchant  = result.get("merchant", "Unknown")
-        total     = float(result.get("total", 0))
-        category  = result.get("category", "Personal/Shopping")
-        items     = result.get("items", [])
-        date      = result.get("date") or datetime.now().strftime("%Y-%m-%d")
-        confidence = result.get("confidence", "medium")
-
-        if total <= 0:
-            await scanning_msg.edit_text(
-                "😕 *Couldn't find a total on this receipt.*\n\nTry a clearer photo!",
-                parse_mode="Markdown"
-            )
-            return
-
-        tx_info = add_tx(chat_id, "expense", total, merchant, category, date, added_by)
-        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-        tx_id = tx_info[0]
-
-        icon = CAT_ICONS.get(category, "•")
-        conf_emoji = "🟢" if confidence == "high" else "🟡" if confidence == "medium" else "🔴"
-
-        items_text = ""
-        if items:
-            items_text = "\n" + "\n".join(f"  • {item}" for item in items[:5])
-            if len(items) > 5:
-                items_text += f"\n  _...and {len(items)-5} more_"
-
-        keyboard = []
-        row = []
-        for i, cat_obj in enumerate(CATEGORIES):
-            row.append(InlineKeyboardButton(
-                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
-                callback_data=f"quickcat_{tx_id}_{cat_obj.name}"
-            ))
-            if len(row) == 2:
-                keyboard.append(row); row = []
+            await scanning_msg.edit_text(f"😕 *Couldn't read receipt*\n_{result['error']}_\n\nTry: `amount description`",parse_mode="Markdown"); return
+        merchant=result.get("merchant","Unknown"); total=float(result.get("total",0))
+        category=result.get("category","Personal/Shopping"); items=result.get("items",[])
+        date=result.get("date") or datetime.now().strftime("%Y-%m-%d"); confidence=result.get("confidence","medium")
+        if total<=0:
+            await scanning_msg.edit_text("😕 Couldn't find a total. Try clearer photo!"); return
+        tx_info=add_tx(chat_id,"expense",total,merchant,category,date,added_by)
+        asyncio.create_task(gs_sync_async(chat_id,*tx_info)); tx_id=tx_info[0]
+        icon=CAT_ICONS.get(category,"•"); ce="🟢" if confidence=="high" else "🟡" if confidence=="medium" else "🔴"
+        items_text=("\n"+"\n".join(f"  • {i}" for i in items[:5])) if items else ""
+        keyboard=[]; row=[]
+        for cat in CATS:
+            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{tx_id}_{cat}"))
+            if len(row)==2: keyboard.append(row); row=[]
         if row: keyboard.append(row)
-
         await scanning_msg.edit_text(
-            f"🧾 *Receipt Scanned!* {conf_emoji}\n"
-            f"{'─'*24}\n"
-            f"{icon} *{merchant}*{items_text}\n\n"
-            f"💸 Total: *{fmt(total)}*\n"
-            f"📁 Category: *{category}*\n"
-            f"👤 Added by {added_by}\n\n"
-            f"_Tap to change category if wrong:_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-        await check_budget_alert(update, ctx, chat_id, category)
-
+            f"🧾 *Receipt Scanned!* {ce}\n{'-'*24}\n{icon} *{merchant}*{items_text}\n\n💸 Total: *{fmt(total)}*\n📁 Category: *{category}*\n👤 {added_by}\n\n_Tap to change category:_",
+            parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
+        await check_budget_alert(update,ctx,chat_id,category)
     except Exception as e:
         print(f"Receipt scan error: {e}")
-        await scanning_msg.edit_text(
-            "😕 *Something went wrong scanning that receipt.*\n\nTry again or log manually:\n`amount description`",
-            parse_mode="Markdown"
-        )
+        await scanning_msg.edit_text("😕 Something went wrong. Try: `amount description`",parse_mode="Markdown")
 
-# ── SMART QUICK-ADD ───────────────────────────────────────────────────────────
+
 async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    match = re.match(r'^(\d+\.?\d*)\s+(.+)$', text)
-    if not match:
-        return
-    try:
-        amount = float(match.group(1))
-        desc = match.group(2).strip()
-    except:
-        return
-
-    chat_id = str(update.effective_chat.id)
-    guessed_cat = guess_category(desc)
-
+    text=update.message.text.strip()
+    match=re.match(r'^(\d+\.?\d*)\s+(.+)$',text)
+    if not match: return
+    try: amount=float(match.group(1)); desc=match.group(2).strip()
+    except: return
+    chat_id=str(update.effective_chat.id); guessed_cat=guess_category(desc)
     if guessed_cat:
-        date = datetime.now().strftime("%Y-%m-%d")
-        added_by = update.effective_user.first_name or "Someone"
-        tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
-        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-        tx_id = tx_info[0]
-        icon = CAT_ICONS.get(guessed_cat, "•")
-
-        keyboard = []
-        row = []
-        for i, cat_obj in enumerate(CATEGORIES):
-            row.append(InlineKeyboardButton(
-                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
-                callback_data=f"quickcat_{tx_id}_{cat_obj.name}"
-            ))
-            if len(row) == 2:
-                keyboard.append(row); row = []
+        date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+        tx_info=add_tx(chat_id,"expense",amount,desc,guessed_cat,date,added_by)
+        asyncio.create_task(gs_sync_async(chat_id,*tx_info)); tx_id=tx_info[0]
+        icon=CAT_ICONS.get(guessed_cat,"•")
+        keyboard=[]; row=[]
+        for cat in CATS:
+            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{tx_id}_{cat}"))
+            if len(row)==2: keyboard.append(row); row=[]
         if row: keyboard.append(row)
-
-        await update.message.reply_text(
-            f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat} · {fmt(amount)}\n_Tap below to change category_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        await check_budget_alert(update, ctx, chat_id, guessed_cat)
+        await update.message.reply_text(f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat} · {fmt(amount)}\n_Tap to change category_",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
+        await check_budget_alert(update,ctx,chat_id,guessed_cat)
     else:
-        keyboard = []
-        row = []
-        for i, cat_obj in enumerate(CATEGORIES):
-            row.append(InlineKeyboardButton(
-                f"{cat_obj.icon} {cat_obj.name.split('/')[0]}",
-                callback_data=f"quickcat_{amount}_{desc[:20]}_{cat_obj.name}"
-            ))
-            if len(row) == 2:
-                keyboard.append(row); row = []
+        keyboard=[]; row=[]
+        for cat in CATS:
+            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"))
+            if len(row)==2: keyboard.append(row); row=[]
         if row: keyboard.append(row)
-        await update.message.reply_text(
-            f"💸 *{fmt(amount)}* — _{desc}_\nWhich category?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        await update.message.reply_text(f"💸 *{fmt(amount)}* — _{desc}_\nWhich category?",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    chat_id = str(update.effective_chat.id)
-    parts = query.data.replace("quickcat_","").split("_")
-    updated_cat = "_".join(parts[1:]) if parts else ""
-    try:
-        maybe_id = int(parts[0])
-    except Exception:
-        maybe_id = None
-
+    query=update.callback_query; await query.answer()
+    chat_id=str(update.effective_chat.id)
+    parts=query.data.replace("quickcat_","").split("_"); updated_cat="_".join(parts[1:]) if parts else ""
+    try: maybe_id=int(parts[0])
+    except: maybe_id=None
     if maybe_id is not None and updated_cat in CATS:
-        tx = get_tx(maybe_id, chat_id)
-        if not tx:
-            await query.edit_message_text("⚠️ Couldn't find that transaction anymore.", parse_mode="Markdown")
-            return
-        update_tx_category(maybe_id, chat_id, updated_cat)
-        asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
-        icon = CAT_ICONS.get(updated_cat, "•")
-        amount = tx[3]
-        desc = tx[4]
-        added_by = tx[7]
-        await query.edit_message_text(
-            f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}",
-            parse_mode="Markdown",
-        )
-        await check_budget_alert_query(query, ctx, chat_id, updated_cat)
-        return
-
-    # Legacy fallback
-    amount = float(parts[0])
-    desc = parts[1]
-    cat = "_".join(parts[2:])
-    txs = get_txs(chat_id)
-    for t in txs:
-        if t[3] == amount and t[4] == desc:
-            del_tx(t[0], chat_id)
-            asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
-            break
-    date = datetime.now().strftime("%Y-%m-%d")
-    added_by = update.effective_user.first_name or "Someone"
-    tx_info = add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
-    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-    icon = CAT_ICONS.get(cat,"•")
-    await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}", parse_mode="Markdown")
-    await check_budget_alert_query(query, ctx, chat_id, cat)
+        tx=get_tx(maybe_id,chat_id)
+        if not tx: await query.edit_message_text("⚠️ Couldn't find that transaction.",parse_mode="Markdown"); return
+        update_tx_category(maybe_id,chat_id,updated_cat)
+        asyncio.create_task(gs_sync_async(chat_id,tx_id=maybe_id,cat=updated_cat,update_category=True))
+        icon=CAT_ICONS.get(updated_cat,"•")
+        await query.edit_message_text(f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(tx[3])} — {tx[4]}\n👤 {tx[7]}",parse_mode="Markdown")
+        await check_budget_alert_query(query,ctx,chat_id,updated_cat); return
+    amount=float(parts[0]); desc=parts[1]; cat="_".join(parts[2:])
+    for t in get_txs(chat_id):
+        if t[3]==amount and t[4]==desc:
+            del_tx(t[0],chat_id); asyncio.create_task(gs_sync_async(chat_id,tx_id=t[0],delete=True)); break
+    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+    tx_info=add_tx(chat_id,"expense",amount,desc,cat,date,added_by)
+    asyncio.create_task(gs_sync_async(chat_id,*tx_info)); icon=CAT_ICONS.get(cat,"•")
+    await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}",parse_mode="Markdown")
+    await check_budget_alert_query(query,ctx,chat_id,cat)
 
 async def check_budget_alert(update, ctx, chat_id, cat):
-    budgets = get_budgets(chat_id)
-    bud = budgets.get(cat, 0)
+    budgets=get_budgets(chat_id); bud=budgets.get(cat,0)
     if not bud: return
-    _, _, by_cat = calc_summary(chat_id)
-    spent = by_cat.get(cat, 0)
-    pct = spent / bud
-    if 0.8 <= pct < 0.82:
-        icon = CAT_ICONS.get(cat,"•")
-        await update.message.reply_text(
-            f"⚠️ *Budget Alert!*\n\n{icon} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",
-            parse_mode="Markdown"
-        )
+    _,_,by_cat=calc_summary(chat_id); spent=by_cat.get(cat,0); pct=spent/bud
+    if 0.8<=pct<0.82:
+        await update.message.reply_text(f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat,chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",parse_mode="Markdown")
 
 async def check_budget_alert_query(query, ctx, chat_id, cat):
-    budgets = get_budgets(chat_id)
-    bud = budgets.get(cat, 0)
+    budgets=get_budgets(chat_id); bud=budgets.get(cat,0)
     if not bud: return
-    _, _, by_cat = calc_summary(chat_id)
-    spent = by_cat.get(cat, 0)
-    pct = spent / bud
-    if 0.8 <= pct < 0.82:
-        icon = CAT_ICONS.get(cat,"•")
-        await query.message.reply_text(
-            f"⚠️ *Budget Alert!*\n\n{icon} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",
-            parse_mode="Markdown"
-        )
+    _,_,by_cat=calc_summary(chat_id); spent=by_cat.get(cat,0); pct=spent/bud
+    if 0.8<=pct<0.82:
+        await query.message.reply_text(f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat,chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",parse_mode="Markdown")
 
-# ── COMMANDS ──────────────────────────────────────────────────────────────────
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Welcome to Yong's Budget Bot!*\n\n"
-        "Track your family spending together 💑\n\n"
-        "*✨ Quick tip:* Just type an amount + description and I'll auto-categorise it!\n"
-        "e.g. `45.50 dinner at nobu` or `120 grab`\n\n"
+        "👋 *Welcome to Yong's Budget Bot!*\n\nTrack your family spending together 💑\n\n"
+        "*✨ Quick tip:* Just type amount + description:\ne.g. `45.50 dinner at nobu` or `120 grab`\n\n"
         "*Commands:*\n"
         "➕ `/add 45.50 dining dinner` — log expense\n"
         "➕ `/income 5000 paycheck` — log income\n"
         "📊 `/summary` — monthly overview\n"
         "📋 `/spent` — category breakdown\n"
         "🏆 `/report` — monthly report card\n"
-        "🧾 `/recent` — last 10 transactions\n"
-        "🔁 `/recurring` — manage recurring expenses\n"
+        "🧾 `/recent` — last 15 transactions\n"
+        "🔁 `/recurring` — manage recurring\n"
         "💰 `/budget groceries 400` — set budget\n"
         "📅 `/month 2026-02` — view past month\n"
-        "📅 `/daily` — today's spending summary\n"
+        "📅 `/daily` — today's spending\n"
         "🗑 `/delete` — delete a transaction\n"
+        "🔄 `/refreshsheets` — rebuild Google Sheets\n"
         "❓ `/help` — all commands",
-        parse_mode="Markdown",
-        reply_markup=main_keyboard())
+        parse_mode="Markdown", reply_markup=main_keyboard())
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *All Commands*\n\n"
-        "*✨ Smart add (no command needed!)*\n"
-        "Just type: `45.50 dinner at nobu`\n"
-        "I'll guess the category automatically!\n\n"
-        "*Logging:*\n"
-        "`/add <amount> <category> <desc>`\n"
-        "`/income <amount> <desc>`\n\n"
-        "*Viewing:*\n"
-        "`/summary` — monthly overview\n"
-        "`/spent` — category breakdown\n"
-        "`/report` — report card with grade\n"
-        "`/recent` — last 10 transactions\n"
-        "`/daily` — today's spending + date picker\n"
-        "`/month YYYY-MM` — past month\n\n"
-        "*Budgets:*\n"
-        "`/budget <category> <amount>`\n"
-        "`/budgets` — see all limits\n\n"
-        "*Recurring:*\n"
-        "`/recurring` — manage recurring expenses\n\n"
-        "*Managing:*\n"
-        "`/delete` — delete a transaction\n\n"
-        "*Category shortcuts:*\n"
-        "`housing` — Housing/Rent\n"
-        "`grocery` — Groceries\n"
-        "`dining` — Dining Out\n"
-        "`sub` — Subscriptions\n"
-        "`transport` — Transportation\n"
-        "`util` — Utilities\n"
-        "`entertain` — Entertainment\n"
-        "`saving` — Savings\n"
-        "`personal` — Personal/Shopping",
+        "*Smart add:* `45.50 dinner at nobu`\n\n"
+        "*Logging:*\n`/add <amount> <category> <desc>`\n`/income <amount> <desc>`\n\n"
+        "*Viewing:*\n`/summary` · `/spent` · `/report` · `/recent` · `/daily` · `/month YYYY-MM`\n\n"
+        "*Budgets:*\n`/budget <category> <amount>` · `/budgets`\n\n"
+        "*Recurring:*\n`/recurring` — view/add/remove\n\n"
+        "*Managing:*\n`/delete` · `/refreshsheets`",
         parse_mode="Markdown")
 
 async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ Usage: `/add <amount> <category> <description>`\nOr just type: `45.50 dinner at nobu`", parse_mode="Markdown"); return
-    try:
-        amount = float(args[0].replace("$","").replace(",",""))
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount.", parse_mode="Markdown"); return
-
-    cat_input = args[1].lower()
-    matched_cat = next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)), "Personal/Shopping")
-    desc = " ".join(args[2:]) if len(args) > 2 else matched_cat
-    date = datetime.now().strftime("%Y-%m-%d")
-    added_by = update.effective_user.first_name or "Someone"
-    tx_info = add_tx(chat_id, "expense", amount, desc, matched_cat, date, added_by)
-    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-    icon = CAT_ICONS.get(matched_cat, "•")
-    budgets = get_budgets(chat_id)
-    _, spent, by_cat = calc_summary(chat_id)
-    cat_spent = by_cat.get(matched_cat, 0)
-    cat_budget = budgets.get(matched_cat, 0)
-    budget_line = ""
+    chat_id=str(update.effective_chat.id); args=ctx.args
+    if len(args)<2: await update.message.reply_text("❌ Usage: `/add <amount> <category> <description>`",parse_mode="Markdown"); return
+    try: amount=float(args[0].replace("$","").replace(",",""))
+    except ValueError: await update.message.reply_text("❌ Invalid amount.",parse_mode="Markdown"); return
+    cat_input=args[1].lower()
+    matched_cat=next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)),"Personal/Shopping")
+    desc=" ".join(args[2:]) if len(args)>2 else matched_cat
+    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+    tx_info=add_tx(chat_id,"expense",amount,desc,matched_cat,date,added_by)
+    asyncio.create_task(gs_sync_async(chat_id,*tx_info))
+    icon=CAT_ICONS.get(matched_cat,"•"); budgets=get_budgets(chat_id)
+    _,_,by_cat=calc_summary(chat_id); cat_budget=budgets.get(matched_cat,0)
+    budget_line=""
     if cat_budget:
-        pct = min((cat_spent/cat_budget)*100, 100)
-        status = budget_status(pct)
-        budget_line = f"\n{status} `{progress_bar(pct,8)}` {pct:.0f}% of {fmt(cat_budget)}"
-
-    await update.message.reply_text(
-        f"✅ *Expense logged!*\n\n{icon} *{matched_cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}{budget_line}",
-        parse_mode="Markdown")
-    await check_budget_alert(update, ctx, chat_id, matched_cat)
+        pct=min((by_cat.get(matched_cat,0)/cat_budget)*100,100)
+        budget_line=f"\n{budget_status(pct)} `{progress_bar(pct,8)}` {pct:.0f}% of {fmt(cat_budget)}"
+    await update.message.reply_text(f"✅ *Expense logged!*\n\n{icon} *{matched_cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}{budget_line}",parse_mode="Markdown")
+    await check_budget_alert(update,ctx,chat_id,matched_cat)
 
 async def add_income(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    args = ctx.args
-    if not args:
-        await update.message.reply_text("❌ Usage: `/income <amount> <description>`", parse_mode="Markdown"); return
-    try:
-        amount = float(args[0].replace("$","").replace(",",""))
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount.", parse_mode="Markdown"); return
-    desc = " ".join(args[1:]) if len(args) > 1 else "Income"
-    date = datetime.now().strftime("%Y-%m-%d")
-    added_by = update.effective_user.first_name or "Someone"
-    tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
-    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-    await update.message.reply_text(
-        f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",
-        parse_mode="Markdown")
+    chat_id=str(update.effective_chat.id); args=ctx.args
+    if not args: await update.message.reply_text("❌ Usage: `/income <amount> <description>`",parse_mode="Markdown"); return
+    try: amount=float(args[0].replace("$","").replace(",",""))
+    except ValueError: await update.message.reply_text("❌ Invalid amount.",parse_mode="Markdown"); return
+    desc=" ".join(args[1:]) if len(args)>1 else "Income"
+    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+    tx_info=add_tx(chat_id,"income",amount,desc,"Income",date,added_by)
+    asyncio.create_task(gs_sync_async(chat_id,*tx_info))
+    await update.message.reply_text(f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",parse_mode="Markdown")
 
 async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
-    chat_id = str(update.effective_chat.id)
-    month = month or get_month()
-    income, spent, by_cat = calc_summary(chat_id, month)
-    remaining = income - spent
-    budgets = get_budgets(chat_id)
-    total_budget = sum(budgets.values())
-    pct = (spent/total_budget*100) if total_budget else 0
-    rem_icon = "✅" if remaining >= 0 else "🔴"
-    savings_rate = (remaining/income*100) if income > 0 else 0
-
-    text = (f"📊 *{month_label(month)} Summary*\n"
-            f"{'─'*28}\n"
-            f"💵 Income:      *{fmt(income)}*\n"
-            f"💸 Spent:       *{fmt(spent)}*\n"
-            f"{rem_icon} Remaining:  *{fmt(abs(remaining))}*{'  left' if remaining>=0 else '  over!'}\n")
-    if income > 0:
-        text += f"📈 Savings rate: *{savings_rate:.0f}%*\n"
-    if total_budget:
-        status = budget_status(pct)
-        text += f"\n{status} `{progress_bar(pct,12)}` {pct:.0f}% of {fmt(total_budget)} budget\n"
+    chat_id=str(update.effective_chat.id); month=month or get_month()
+    income,spent,by_cat=calc_summary(chat_id,month)
+    remaining=income-spent; budgets=get_budgets(chat_id)
+    total_budget=sum(budgets.values()); pct=(spent/total_budget*100) if total_budget else 0
+    savings_rate=(remaining/income*100) if income>0 else 0; rem_icon="✅" if remaining>=0 else "🔴"
+    text=(f"📊 *{month_label(month)} Summary*\n{'-'*28}\n"
+          f"💵 Income:     *{fmt(income)}*\n💸 Spent:      *{fmt(spent)}*\n"
+          f"{rem_icon} Remaining: *{fmt(abs(remaining))}*{'  left' if remaining>=0 else '  over!'}\n")
+    if income>0: text+=f"📈 Savings rate: *{savings_rate:.0f}%*\n"
+    if total_budget: text+=f"\n{budget_status(pct)} `{progress_bar(pct,12)}` {pct:.0f}% of {fmt(total_budget)} budget\n"
     if by_cat:
-        text += f"\n*Top categories:*\n{'─'*28}\n"
-        for cat, amt in sorted(by_cat.items(), key=lambda x:-x[1])[:5]:
-            bud = budgets.get(cat,0)
-            status = budget_status((amt/bud*100) if bud else 0) if bud else "  "
-            bud_str = f" / {fmt(bud)}" if bud else ""
-            text += f"{CAT_ICONS.get(cat,'•')} {cat}: *{fmt(amt)}*{bud_str} {status}\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        text+=f"\n*Top categories:*\n{'-'*28}\n"
+        for cat,amt in sorted(by_cat.items(),key=lambda x:-x[1])[:5]:
+            bud=budgets.get(cat,0); status=budget_status((amt/bud*100) if bud else 0) if bud else "  "
+            bud_str=f" / {fmt(bud)}" if bud else ""
+            text+=f"{CAT_ICONS.get(cat,chr(8226))} {cat}: *{fmt(amt)}*{bud_str} {status}\n"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def report_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    month = get_month()
-    income, spent, by_cat = calc_summary(chat_id, month)
-    budgets = get_budgets(chat_id)
-    total_budget = sum(budgets.values())
-
-    last_month = (datetime.now().replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    _, last_spent, last_by_cat = calc_summary(chat_id, last_month)
-    diff = spent - last_spent
-    diff_str = f"{'📈 +' if diff > 0 else '📉 '}{fmt(abs(diff))} vs last month"
-
-    pct_used = (spent/total_budget) if total_budget else 0
-    grade, grade_msg = get_grade(pct_used)
-    savings_rate = ((income-spent)/income*100) if income > 0 else 0
-
-    text = (f"🏆 *{month_label()} Report Card*\n"
-            f"{'─'*28}\n"
-            f"Grade: *{grade}* — {grade_msg}\n"
-            f"{'─'*28}\n"
-            f"💵 Income:   *{fmt(income)}*\n"
-            f"💸 Spent:    *{fmt(spent)}*\n"
-            f"💰 Saved:    *{fmt(income-spent)}* ({savings_rate:.0f}%)\n"
-            f"{diff_str}\n")
-
+    chat_id=str(update.effective_chat.id); month=get_month()
+    income,spent,by_cat=calc_summary(chat_id,month); budgets=get_budgets(chat_id); total_budget=sum(budgets.values())
+    last_month=(datetime.now().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
+    _,last_spent,_=calc_summary(chat_id,last_month); diff=spent-last_spent
+    diff_str=f"{chr(128200)+' +' if diff>0 else chr(128201)+' ' }{fmt(abs(diff))} vs last month"
+    pct_used=(spent/total_budget) if total_budget else 0; grade,grade_msg=get_grade(pct_used)
+    savings_rate=((income-spent)/income*100) if income>0 else 0
+    text=(f"🏆 *{month_label()} Report Card*\n{'-'*28}\nGrade: *{grade}* — {grade_msg}\n{'-'*28}\n"
+          f"💵 Income: *{fmt(income)}*\n💸 Spent: *{fmt(spent)}*\n💰 Saved: *{fmt(income-spent)}* ({savings_rate:.0f}%)\n{diff_str}\n")
     if total_budget:
-        text += f"\n*Category breakdown:*\n{'─'*28}\n"
+        text+=f"\n*Category breakdown:*\n{'-'*28}\n"
         for cat in CATS:
-            s = by_cat.get(cat, 0)
-            b = budgets.get(cat, 0)
+            s=by_cat.get(cat,0); b=budgets.get(cat,0)
             if not s and not b: continue
-            icon = CAT_ICONS.get(cat,"•")
+            icon=CAT_ICONS.get(cat,"•")
             if b:
-                pct = min((s/b)*100,100)
-                status = budget_status(pct)
-                bar = progress_bar(pct, 6)
-                text += f"{icon} {cat.split('/')[0]}\n`{bar}` {fmt(s)}/{fmt(b)} {status}\n"
-            else:
-                text += f"{icon} {cat.split('/')[0]}: {fmt(s)}\n"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
+                pct=min((s/b)*100,100); status=budget_status(pct)
+                text+=f"{icon} {cat.split('/')[0]}\n`{progress_bar(pct,6)}` {fmt(s)}/{fmt(b)} {status}\n"
+            else: text+=f"{icon} {cat.split('/')[0]}: {fmt(s)}\n"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def spent_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    income, total_spent, by_cat = calc_summary(chat_id)
-    budgets = get_budgets(chat_id)
-    if not by_cat:
-        await update.message.reply_text(f"No expenses yet for {month_label()}.\n\nJust type an amount to log one!\ne.g. `45.50 dinner`", parse_mode="Markdown"); return
-
-    text = f"📋 *Spending — {month_label()}*\n{'─'*28}\n\n"
+    chat_id=str(update.effective_chat.id); _,total_spent,by_cat=calc_summary(chat_id); budgets=get_budgets(chat_id)
+    if not by_cat: await update.message.reply_text(f"No expenses yet for {month_label()}.\n\nType `45.50 dinner` to log one!",parse_mode="Markdown"); return
+    text=f"📋 *Spending — {month_label()}*\n{'-'*28}\n\n"
     for cat in CATS:
-        spent = by_cat.get(cat,0); bud = budgets.get(cat,0)
+        spent=by_cat.get(cat,0); bud=budgets.get(cat,0)
         if not spent and not bud: continue
-        icon = CAT_ICONS.get(cat,"•")
+        icon=CAT_ICONS.get(cat,"•")
         if bud:
-            pct = min((spent/bud)*100,100)
-            status = budget_status(pct)
-            text += f"{icon} *{cat}*\n`{progress_bar(pct,8)}` {fmt(spent)} / {fmt(bud)} {status}\n\n"
-        else:
-            text += f"{icon} *{cat}*: {fmt(spent)}\n\n"
-    text += f"{'─'*28}\n💸 *Total: {fmt(total_spent)}*"
-    await update.message.reply_text(text, parse_mode="Markdown")
+            pct=min((spent/bud)*100,100); status=budget_status(pct)
+            text+=f"{icon} *{cat}*\n`{progress_bar(pct,8)}` {fmt(spent)} / {fmt(bud)} {status}\n\n"
+        else: text+=f"{icon} *{cat}*: {fmt(spent)}\n\n"
+    text+=f"{'-'*28}\n💸 *Total: {fmt(total_spent)}*"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def recent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    txs = get_txs(chat_id)[:15]
-    if not txs:
-        await update.message.reply_text("No transactions this month yet!\n\nJust type an amount to log one!\ne.g. `45.50 dinner`", parse_mode="Markdown"); return
-    text = f"🧾 *Recent Transactions*\n{'─'*28}\n\n"
+    chat_id=str(update.effective_chat.id); txs=get_txs(chat_id)[:15]
+    if not txs: await update.message.reply_text("No transactions this month yet!\nType `45.50 dinner` to log one.",parse_mode="Markdown"); return
+    text=f"🧾 *Recent Transactions*\n{'-'*28}\n\n"
     for t in txs:
-        icon = "💵" if t[2]=="income" else CAT_ICONS.get(t[5],"•")
-        sign = "+" if t[2]=="income" else "-"
-        date_str = datetime.strptime(t[6],"%Y-%m-%d").strftime("%b %d")
-        text += f"{icon} *{sign}{fmt(t[3])}*  {t[4]}\n_{date_str} · {t[7]}_\n\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
+        icon="💵" if t[2]=="income" else CAT_ICONS.get(t[5],"•")
+        sign="+" if t[2]=="income" else "-"
+        date_str=datetime.strptime(t[6],"%Y-%m-%d").strftime("%b %d")
+        text+=f"{icon} *{sign}{fmt(t[3])}*  {t[4]}\n_{date_str} · {t[7]}_\n\n"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    txs = get_txs(chat_id)[:15]
-    if not txs:
-        await update.message.reply_text("No transactions to delete!", parse_mode="Markdown"); return
-    keyboard = []
+    chat_id=str(update.effective_chat.id); txs=get_txs(chat_id)[:15]
+    if not txs: await update.message.reply_text("No transactions to delete!",parse_mode="Markdown"); return
+    keyboard=[]
     for t in txs:
-        icon = "💵" if t[2]=="income" else CAT_ICONS.get(t[5],"•")
-        sign = "+" if t[2]=="income" else "-"
-        date_str = datetime.strptime(t[6],"%Y-%m-%d").strftime("%b %d")
-        keyboard.append([InlineKeyboardButton(f"{icon} {sign}${t[3]:.0f} {t[4][:18]} · {date_str}", callback_data=f"del_{t[0]}")])
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")])
-    await update.message.reply_text("🗑 *Which transaction to delete?*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        icon="💵" if t[2]=="income" else CAT_ICONS.get(t[5],"•")
+        sign="+" if t[2]=="income" else "-"
+        date_str=datetime.strptime(t[6],"%Y-%m-%d").strftime("%b %d")
+        keyboard.append([InlineKeyboardButton(f"{icon} {sign}${t[3]:.0f} {t[4][:18]} · {date_str}",callback_data=f"del_{t[0]}")])
+    keyboard.append([InlineKeyboardButton("❌ Cancel",callback_data="del_cancel")])
+    await update.message.reply_text("🗑 *Which transaction to delete?*",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def delete_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    chat_id = str(update.effective_chat.id)
-    if query.data == "del_cancel":
-        await query.edit_message_text("Cancelled."); return
-    tx_id = int(query.data.replace("del_",""))
-    del_tx(tx_id, chat_id)
-    asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, delete=True))
+    query=update.callback_query; await query.answer(); chat_id=str(update.effective_chat.id)
+    if query.data=="del_cancel": await query.edit_message_text("Cancelled."); return
+    tx_id=int(query.data.replace("del_",""))
+    del_tx(tx_id,chat_id); asyncio.create_task(gs_sync_async(chat_id,tx_id=tx_id,delete=True))
     await query.edit_message_text("✅ Transaction deleted.")
 
 async def budget_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id); args = ctx.args
-    if len(args) < 2:
-        keyboard = [[InlineKeyboardButton(f"{cat_obj.icon} {cat_obj.name.split('/')[0]}", callback_data=f"budcat_{cat_obj.name}")] for cat_obj in CATEGORIES]
-        await update.message.reply_text("💰 *Which category to set budget for?*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)); return
-    try:
-        amount = float(args[-1].replace("$","").replace(",",""))
-    except ValueError:
-        await update.message.reply_text("❌ Invalid amount.", parse_mode="Markdown"); return
-    cat_input = " ".join(args[:-1]).lower()
-    matched_cat = next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)), None)
-    if not matched_cat:
-        await update.message.reply_text("❌ Category not found.", parse_mode="Markdown"); return
-    set_budget(chat_id, matched_cat, amount)
-    await update.message.reply_text(f"✅ *Budget set!*\n\n{CAT_ICONS.get(matched_cat,'•')} *{matched_cat}*\n💰 {fmt(amount)}/month", parse_mode="Markdown")
+    chat_id=str(update.effective_chat.id); args=ctx.args
+    if len(args)<2:
+        keyboard=[[InlineKeyboardButton(f"{CAT_ICONS.get(c,chr(8226))} {c.split('/')[0]}",callback_data=f"budcat_{c}")] for c in CATS]
+        await update.message.reply_text("💰 *Which category to set budget for?*",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard)); return
+    try: amount=float(args[-1].replace("$","").replace(",",""))
+    except ValueError: await update.message.reply_text("❌ Invalid amount.",parse_mode="Markdown"); return
+    cat_input=" ".join(args[:-1]).lower()
+    matched_cat=next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)),None)
+    if not matched_cat: await update.message.reply_text("❌ Category not found.",parse_mode="Markdown"); return
+    set_budget(chat_id,matched_cat,amount)
+    await update.message.reply_text(f"✅ *Budget set!*\n\n{CAT_ICONS.get(matched_cat,chr(8226))} *{matched_cat}*\n💰 {fmt(amount)}/month",parse_mode="Markdown")
 
 async def budcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    cat = query.data.replace("budcat_","")
-    await query.edit_message_text(
-        f"💰 Setting budget for *{cat}*\n\nReply with the amount, e.g.:\n`/budget {cat.lower().split('/')[0]} 500`",
-        parse_mode="Markdown")
+    query=update.callback_query; await query.answer(); cat=query.data.replace("budcat_","")
+    await query.edit_message_text(f"💰 Setting budget for *{cat}*\n\nReply with:\n`/budget {cat.lower().split('/')[0]} 500`",parse_mode="Markdown")
 
 async def budgets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    bud = get_budgets(chat_id)
-    _, spent, by_cat = calc_summary(chat_id)
-    if not bud:
-        await update.message.reply_text("No budgets set yet!\nUse `/budget <category> <amount>`", parse_mode="Markdown"); return
-    text = f"💰 *Monthly Budgets*\n{'─'*28}\n\n"
+    chat_id=str(update.effective_chat.id); bud=get_budgets(chat_id); _,_,by_cat=calc_summary(chat_id)
+    if not bud: await update.message.reply_text("No budgets set yet!\nUse `/budget <category> <amount>`",parse_mode="Markdown"); return
+    text=f"💰 *Monthly Budgets*\n{'-'*28}\n\n"
     for cat in CATS:
         if cat in bud:
-            s = by_cat.get(cat, 0)
-            pct = min((s/bud[cat])*100,100) if bud[cat] else 0
-            status = budget_status(pct)
-            text += f"{CAT_ICONS.get(cat,'•')} *{cat}*: {fmt(bud[cat])} {status}\n"
-    text += f"\n{'─'*28}\n📊 Total: *{fmt(sum(bud.values()))}/month*"
-    await update.message.reply_text(text, parse_mode="Markdown")
+            s=by_cat.get(cat,0); pct=min((s/bud[cat])*100,100) if bud[cat] else 0
+            text+=f"{CAT_ICONS.get(cat,chr(8226))} *{cat}*: {fmt(bud[cat])} {budget_status(pct)}\n"
+    text+=f"\n{'-'*28}\n📊 Total: *{fmt(sum(bud.values()))}/month*"
+    await update.message.reply_text(text,parse_mode="Markdown")
 
 async def recurring_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    args = ctx.args
-    recurrings = get_recurring(chat_id)
-
+    chat_id=str(update.effective_chat.id); args=ctx.args; recurrings=get_recurring(chat_id)
     if not args:
-        text = f"🔁 *Recurring Expenses*\n{'─'*28}\n\n"
+        text=f"🔁 *Recurring Expenses*\n{'-'*28}\n\n"
         if recurrings:
-            for r in recurrings:
-                icon = CAT_ICONS.get(r[4],"•")
-                text += f"{icon} *{fmt(r[2])}* — {r[3]}\n_{r[4]} · day {r[5]} of each month_\n\n"
-        else:
-            text += "_No recurring expenses set yet._\n\n"
-        text += "To add: `/recurring add <amount> <category> <description> <day>`\nExample: `/recurring add 3200 housing rent 1`\n\nTo remove: `/recurring remove`"
-        await update.message.reply_text(text, parse_mode="Markdown"); return
-
-    if args[0] == "add":
-        if len(args) < 5:
-            await update.message.reply_text("Usage: `/recurring add <amount> <category> <description> <day>`\nExample: `/recurring add 3200 housing rent 1`", parse_mode="Markdown"); return
+            for r in recurrings: text+=f"{CAT_ICONS.get(r[4],chr(8226))} *{fmt(r[2])}* — {r[3]}\n_{r[4]} · day {r[5]} of month_\n\n"
+        else: text+="_None set yet._\n\n"
+        text+="Add: `/recurring add <amount> <category> <desc> <day>`\nRemove: `/recurring remove`"
+        await update.message.reply_text(text,parse_mode="Markdown"); return
+    if args[0]=="add":
+        if len(args)<5: await update.message.reply_text("Usage: `/recurring add <amount> <category> <desc> <day>`",parse_mode="Markdown"); return
         try:
-            amount = float(args[1])
-            day = int(args[-1])
-            cat_input = args[2].lower()
-            matched_cat = next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)), "Personal/Shopping")
-            desc = " ".join(args[3:-1])
-        except:
-            await update.message.reply_text("❌ Invalid format.", parse_mode="Markdown"); return
-        add_recurring(chat_id, amount, desc, matched_cat, day)
-        icon = CAT_ICONS.get(matched_cat,"•")
-        await update.message.reply_text(f"✅ *Recurring added!*\n\n{icon} *{matched_cat}*\n💸 {fmt(amount)} — {desc}\n📅 Logs automatically on day {day} each month", parse_mode="Markdown"); return
-
-    if args[0] == "remove":
-        if not recurrings:
-            await update.message.reply_text("No recurring expenses to remove!", parse_mode="Markdown"); return
-        keyboard = [[InlineKeyboardButton(f"{CAT_ICONS.get(r[4],'•')} {fmt(r[2])} {r[3]}", callback_data=f"delrec_{r[0]}")] for r in recurrings]
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="del_cancel")])
-        await update.message.reply_text("Which recurring expense to remove?", reply_markup=InlineKeyboardMarkup(keyboard)); return
+            amount=float(args[1]); day=int(args[-1]); cat_input=args[2].lower()
+            matched_cat=next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)),"Personal/Shopping")
+            desc=" ".join(args[3:-1])
+        except: await update.message.reply_text("❌ Invalid format.",parse_mode="Markdown"); return
+        add_recurring(chat_id,amount,desc,matched_cat,day)
+        await update.message.reply_text(f"✅ *Recurring added!*\n\n{CAT_ICONS.get(matched_cat,chr(8226))} *{matched_cat}*\n💸 {fmt(amount)} — {desc}\n📅 Day {day} each month",parse_mode="Markdown"); return
+    if args[0]=="remove":
+        if not recurrings: await update.message.reply_text("Nothing to remove!",parse_mode="Markdown"); return
+        keyboard=[[InlineKeyboardButton(f"{CAT_ICONS.get(r[4],chr(8226))} {fmt(r[2])} {r[3]}",callback_data=f"delrec_{r[0]}")] for r in recurrings]
+        keyboard.append([InlineKeyboardButton("❌ Cancel",callback_data="del_cancel")])
+        await update.message.reply_text("Which to remove?",reply_markup=InlineKeyboardMarkup(keyboard)); return
 
 async def delrec_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    chat_id = str(update.effective_chat.id)
-    r_id = int(query.data.replace("delrec_",""))
-    del_recurring(r_id, chat_id)
+    query=update.callback_query; await query.answer(); chat_id=str(update.effective_chat.id)
+    del_recurring(int(query.data.replace("delrec_","")),chat_id)
     await query.edit_message_text("✅ Recurring expense removed.")
 
 async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
-    if not args:
-        await update.message.reply_text("Usage: `/month YYYY-MM`", parse_mode="Markdown"); return
-    try: datetime.strptime(args[0], "%Y-%m")
-    except ValueError:
-        await update.message.reply_text("❌ Use format YYYY-MM e.g. `2026-02`", parse_mode="Markdown"); return
-    await summary(update, ctx, month=args[0])
+    args=ctx.args
+    if not args: await update.message.reply_text("Usage: `/month YYYY-MM`",parse_mode="Markdown"); return
+    try: datetime.strptime(args[0],"%Y-%m")
+    except ValueError: await update.message.reply_text("❌ Use format YYYY-MM e.g. `2026-02`",parse_mode="Markdown"); return
+    await summary(update,ctx,month=args[0])
 
 async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now().strftime("%Y-%m-%d")
-    await _send_daily(update, str(update.effective_chat.id), today, is_callback=False)
+    await _send_daily(update,str(update.effective_chat.id),datetime.now().strftime("%Y-%m-%d"),is_callback=False)
 
 async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback: bool):
-    txs        = get_txs_by_date(chat_id, date_str)
-    expenses   = [t for t in txs if t[2] == "expense"]
-    total_today = sum(t[3] for t in expenses)
-
-    month      = date_str[:7]
-    _, month_spent, by_cat_month = calc_summary(chat_id, month)
-    budgets    = get_budgets(chat_id)
-    total_budget = sum(budgets.values())
-
-    try:
-        day_num   = int(date_str[8:])
-        daily_avg = month_spent / day_num if day_num else 0
-    except Exception:
-        daily_avg = 0
-
+    txs=get_txs_by_date(chat_id,date_str); expenses=[t for t in txs if t[2]=="expense"]
+    total_today=sum(t[3] for t in expenses); month=date_str[:7]
+    _,month_spent,by_cat_month=calc_summary(chat_id,month); budgets=get_budgets(chat_id)
+    total_budget=sum(budgets.values())
+    try: day_num=int(date_str[8:]); daily_avg=month_spent/day_num if day_num else 0
+    except: daily_avg=0
     try:
         from calendar import monthrange
-        days_in_month = monthrange(int(date_str[:4]), int(date_str[5:7]))[1]
-        daily_budget_share = (total_budget / days_in_month) if total_budget else 0
-        budget_left_today  = daily_budget_share - total_today
-    except Exception:
-        daily_budget_share = 0
-        budget_left_today  = 0
-
-    by_cat_today: dict = {}
-    for t in expenses:
-        by_cat_today[t[5]] = by_cat_today.get(t[5], 0) + t[3]
-
-    today_dt   = datetime.now().strftime("%Y-%m-%d")
-    date_dt    = datetime.strptime(date_str, "%Y-%m-%d")
-    if date_str == today_dt:
-        date_label = f"Today · {date_dt.strftime('%a, %d %b %Y')}"
-    elif date_str == (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d"):
-        date_label = f"Yesterday · {date_dt.strftime('%a, %d %b %Y')}"
+        days_in_month=monthrange(int(date_str[:4]),int(date_str[5:7]))[1]
+        daily_budget_share=(total_budget/days_in_month) if total_budget else 0
+        budget_left_today=daily_budget_share-total_today
+    except: daily_budget_share=0; budget_left_today=0
+    by_cat_today={}
+    for t in expenses: by_cat_today[t[5]]=by_cat_today.get(t[5],0)+t[3]
+    today_dt=datetime.now().strftime("%Y-%m-%d"); date_dt=datetime.strptime(date_str,"%Y-%m-%d")
+    if date_str==today_dt: date_label=f"Today · {date_dt.strftime('%a, %d %b %Y')}"
+    elif date_str==(datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d"): date_label=f"Yesterday · {date_dt.strftime('%a, %d %b %Y')}"
+    else: date_label=date_dt.strftime("%A, %d %b %Y")
+    text=f"📅 *Daily Summary — {date_label}*\n{'-'*30}\n\n"
+    if not expenses: text+="🎉 *No spending today!* 👏\n\n"
     else:
-        date_label = date_dt.strftime("%A, %d %b %Y")
-
-    text = f"📅 *Daily Summary — {date_label}*\n{'─'*30}\n\n"
-
-    if not expenses:
-        text += "🎉 *No spending today!*\n_Great job keeping the wallet closed_ 👏\n\n"
-    else:
-        text += "*Transactions:*\n"
-        for t in expenses:
-            icon = CAT_ICONS.get(t[5], "•")
-            text += f"{icon} {fmt(t[3])}  _{t[4]}_  · `{t[5].split('/')[0]}`\n"
-        text += "\n"
-        text += f"💸 *Total today:* {fmt(total_today)}\n"
-
-        if daily_avg > 0:
-            diff    = total_today - daily_avg
-            arrow   = "📈" if diff > 0 else "📉"
-            diff_str = f"+{fmt(abs(diff))}" if diff > 0 else f"-{fmt(abs(diff))}"
-            text += f"{arrow} vs daily avg: *{fmt(daily_avg)}*  ({diff_str})\n"
-
+        text+="*Transactions:*\n"
+        for t in expenses: text+=f"{CAT_ICONS.get(t[5],chr(8226))} {fmt(t[3])}  _{t[4]}_  · `{t[5].split('/')[0]}`\n"
+        text+=f"\n💸 *Total today:* {fmt(total_today)}\n"
+        if daily_avg>0:
+            diff=total_today-daily_avg; arrow="📈" if diff>0 else "📉"
+            diff_str=f"+{fmt(abs(diff))}" if diff>0 else f"-{fmt(abs(diff))}"
+            text+=f"{arrow} vs daily avg: *{fmt(daily_avg)}*  ({diff_str})\n"
         if by_cat_today:
-            text += f"\n*By category:*\n"
-            for cat, amt in sorted(by_cat_today.items(), key=lambda x: -x[1]):
-                icon = CAT_ICONS.get(cat, "•")
-                month_cat_spent = by_cat_month.get(cat, 0)
-                bud = budgets.get(cat, 0)
+            text+="\n*By category:*\n"
+            for cat,amt in sorted(by_cat_today.items(),key=lambda x:-x[1]):
+                bud=budgets.get(cat,0)
                 if bud:
-                    pct = min((month_cat_spent / bud) * 100, 100)
-                    status = budget_status(pct)
-                    text += f"{icon} {cat}: *{fmt(amt)}*  {status} _{pct:.0f}% monthly budget used_\n"
-                else:
-                    text += f"{icon} {cat}: *{fmt(amt)}*\n"
-        text += "\n"
-
-    if total_budget and daily_budget_share > 0:
-        if budget_left_today >= 0:
-            text += f"✅ *Daily budget left:* {fmt(budget_left_today)}\n"
+                    pct=min((by_cat_month.get(cat,0)/bud)*100,100); status=budget_status(pct)
+                    text+=f"{CAT_ICONS.get(cat,chr(8226))} {cat}: *{fmt(amt)}*  {status} _{pct:.0f}% of monthly budget_\n"
+                else: text+=f"{CAT_ICONS.get(cat,chr(8226))} {cat}: *{fmt(amt)}*\n"
+        text+="\n"
+    if total_budget and daily_budget_share>0:
+        if budget_left_today>=0:
+            text+=f"\u2705 *Daily budget left:* {fmt(abs(budget_left_today))}\n"
         else:
-            text += f"⚠️ *Over daily budget by:* {fmt(abs(budget_left_today))}\n"
-
-    text += f"\n📊 *{month_label(month)} so far:* {fmt(month_spent)}"
-    if total_budget:
-        pct_month = (month_spent / total_budget * 100)
-        text += f"  /  {fmt(total_budget)}  {budget_status(pct_month)}"
-    text += "\n"
-
-    pivot    = datetime.strptime(date_str, "%Y-%m-%d")
-    base_day = min(pivot, datetime.strptime(today_dt, "%Y-%m-%d"))
-    dates    = [base_day - timedelta(days=i) for i in range(4, -1, -1)]
-    date_row = []
+            text+=f"\u26a0\ufe0f *Daily budget over by:* {fmt(abs(budget_left_today))}\n"
+    text+=f"\n📊 *{month_label(month)} so far:* {fmt(month_spent)}"
+    if total_budget: text+=f"  /  {fmt(total_budget)}  {budget_status(month_spent/total_budget*100)}"
+    text+="\n"
+    pivot=datetime.strptime(date_str,"%Y-%m-%d"); base_day=min(pivot,datetime.strptime(today_dt,"%Y-%m-%d"))
+    dates=[base_day-timedelta(days=i) for i in range(4,-1,-1)]; date_row=[]
     for d in dates:
-        ds    = d.strftime("%Y-%m-%d")
-        label = d.strftime("%d/%m")
-        if ds == date_str:
-            label = f"[{label}]"
-        date_row.append(InlineKeyboardButton(label, callback_data=f"daily_{ds}"))
-
-    keyboard = [date_row, [InlineKeyboardButton("◀ Earlier", callback_data=f"daily_prev_{date_str}")]]
-
-    if is_callback:
-        await update_or_query.edit_message_text(
-            text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    else:
-        await update_or_query.message.reply_text(
-            text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
+        ds=d.strftime("%Y-%m-%d"); label=f"[{d.strftime('%d/%m')}]" if ds==date_str else d.strftime("%d/%m")
+        date_row.append(InlineKeyboardButton(label,callback_data=f"daily_{ds}"))
+    keyboard=[date_row,[InlineKeyboardButton("◄ Earlier",callback_data=f"daily_prev_{date_str}")]]
+    if is_callback: await update_or_query.edit_message_text(text,parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
+    else: await update_or_query.message.reply_text(text,parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    chat_id = str(update.effective_chat.id)
-    data    = query.data
-
-    if data.startswith("daily_prev_"):
-        anchor    = datetime.strptime(data.replace("daily_prev_", ""), "%Y-%m-%d")
-        new_date  = (anchor - timedelta(days=5)).strftime("%Y-%m-%d")
-    else:
-        new_date = data.replace("daily_", "")
-
-    await _send_daily(query, chat_id, new_date, is_callback=True)
+    query=update.callback_query; await query.answer(); chat_id=str(update.effective_chat.id); data=query.data
+    if data.startswith("daily_prev_"): new_date=(datetime.strptime(data.replace("daily_prev_",""),"%Y-%m-%d")-timedelta(days=5)).strftime("%Y-%m-%d")
+    else: new_date=data.replace("daily_","")
+    await _send_daily(query,chat_id,new_date,is_callback=True)
 
 async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    mapping = {
-        "📊 Summary": summary,
-        "📋 Spent": spent_cmd,
-        "🏆 Report": report_cmd,
-        "🧾 Recent": recent,
-        "💰 Budgets": budgets_cmd,
-        "🗑 Delete": delete_cmd,
-        "🔁 Recurring": recurring_cmd,
-        "❓ Help": help_cmd,
-    }
-    if text in mapping:
-        await mapping[text](update, ctx)
-    else:
-        await smart_add(update, ctx)
+    text=update.message.text
+    mapping={"📊 Summary":summary,"📋 Spent":spent_cmd,"🏆 Report":report_cmd,"🧾 Recent":recent,"👫 Who":who_cmd,"💰 Budgets":budgets_cmd,"🗑 Delete":delete_cmd,"🔁 Recurring":recurring_cmd,"❓ Help":help_cmd,"🔄 Sheets":refresh_sheets_cmd}
+    if text in mapping: await mapping[text](update,ctx)
+    else: await smart_add(update,ctx)
 
-async def refresh_sheets_cmd(update, ctx):
-    """Force-rebuild all Google Sheets tabs immediately."""
-    chat_id = str(update.effective_chat.id)
+async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id=str(update.effective_chat.id)
     if not GOOGLE_SHEETS_CREDS or not GOOGLE_SHEET_ID:
+        await update.message.reply_text("⚠️ Google Sheets not configured."); return
+    msg=await update.message.reply_text("🔄 Refreshing Google Sheets...")
+    errors=[]; loop=asyncio.get_event_loop()
+    def _run():
+        _,spreadsheet=_get_gs()
+        if not spreadsheet: errors.append("Could not connect."); return
+        month=get_month()
+        for label,fn,args in [
+            ("Budget Tracker",gs_refresh_budget,(spreadsheet,chat_id,month)),
+            ("Summary",gs_refresh_summary,(spreadsheet,chat_id)),
+            ("Dashboard",gs_refresh_dashboard,(spreadsheet,chat_id)),
+        ]:
+            try: fn(*args); print(f"{label} OK")
+            except Exception as e: errors.append(f"{label}: {e}")
+            time.sleep(3)
+    await loop.run_in_executor(None,_run)
+    if errors: await msg.edit_text(f"⚠️ *Errors:*\n`{chr(124).join(errors)[:600]}`",parse_mode="Markdown")
+    else: await msg.edit_text(
+        "✅ *Google Sheets updated!*\n\n"
+        "Your chart ranges:\n"
+        "• Donut  → `Budget Tracker!A2:A10, C2:C10`\n"
+        "• Bar    → `Budget Tracker!A2:C10`\n"
+        "• Line   → `Summary!A:D`",
+        parse_mode="Markdown")
+
+async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show spending breakdown by person for the current month."""
+    chat_id = str(update.effective_chat.id)
+    month   = get_month()
+    txs     = get_txs(chat_id, month)
+    expenses = [t for t in txs if t[2] == "expense"]
+
+    if not expenses:
         await update.message.reply_text(
-            "⚠️ Google Sheets not configured.",
+            f"No expenses logged yet for {month_label()}!",
             parse_mode="Markdown"
         )
         return
-    msg = await update.message.reply_text("🔄 Refreshing Google Sheets... give me a moment!")
-    errors = []
-    def _run():
-        _, spreadsheet = _get_gs()
-        if not spreadsheet:
-            errors.append("Could not connect to Google Sheets.")
-            return
-        month = get_month()
-        try:
-            _refresh_budget_sheet(spreadsheet, chat_id, month)
-        except Exception as e:
-            errors.append(f"Budget sheet: {e}")
-        try:
-            _refresh_summary_sheet(spreadsheet, chat_id)
-        except Exception as e:
-            errors.append(f"Summary sheet: {e}")
-        try:
-            _refresh_dashboard(spreadsheet, chat_id)
-        except Exception as e:
-            errors.append(f"Dashboard: {e}")
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _run)
-    if errors:
-        err_text = "\n".join(f"❌ {e}" for e in errors)
-        await msg.edit_text(f"⚠️ *Sheets refreshed with errors:*\n\n`{err_text[:800]}`", parse_mode="Markdown")
-    else:
-        await msg.edit_text(
-            "✅ *Google Sheets updated!*\n\n"
-            "All 4 tabs rebuilt:\n"
-            "• Dashboard\n• Transactions\n• Budget Tracker\n• Summary",
-            parse_mode="Markdown"
-        )
+
+    # Aggregate by person
+    by_person = {}
+    by_person_cat = {}
+    total_spent = sum(t[3] for t in expenses)
+
+    for t in expenses:
+        person = t[7]  # added_by
+        amount = t[3]
+        cat    = t[5]
+        by_person[person]          = by_person.get(person, 0) + amount
+        if person not in by_person_cat:
+            by_person_cat[person]  = {}
+        by_person_cat[person][cat] = by_person_cat[person].get(cat, 0) + amount
+
+    # Sort people by spend descending
+    ranked = sorted(by_person.items(), key=lambda x: -x[1])
+
+    text = f"\U0001f46b *Who spent what — {month_label()}*\n{'─'*28}\n\n"
+    text += f"💸 *Total: {fmt(total_spent)}*\n\n"
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (person, amount) in enumerate(ranked):
+        pct    = round(amount / total_spent * 100) if total_spent else 0
+        medal  = medals[i] if i < len(medals) else "👤"
+        bar    = progress_bar(pct, 8)
+        text  += f"{medal} *{person}*\n"
+        text  += f"`{bar}` {fmt(amount)} ({pct}%)\n"
+
+        # Top 3 categories for this person
+        cats = sorted(by_person_cat[person].items(), key=lambda x: -x[1])[:3]
+        for cat, amt in cats:
+            icon  = CAT_ICONS.get(cat, "•")
+            text += f"  {icon} {cat}: {fmt(amt)}\n"
+        text += "\n"
+
+    # Fun stat — most expensive single transaction
+    priciest = max(expenses, key=lambda t: t[3])
+    icon = CAT_ICONS.get(priciest[5], "•")
+    text += f"{'─'*28}\n"
+    text += f"🏷 *Biggest single spend:*\n{icon} {fmt(priciest[3])} — {priciest[4]}\n_{priciest[7]} on {datetime.strptime(priciest[6], '%Y-%m-%d').strftime('%d %b')}_"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤷 Unknown command. Type /help to see all commands.")
 
-# ── SCHEDULED TASKS ───────────────────────────────────────────────────────────
+
 async def weekly_digest(app):
-    chats = get_all_chats()
-    for chat_id in chats:
+    for chat_id in get_all_chats():
         try:
-            month = get_month()
-            income, spent, by_cat = calc_summary(chat_id, month)
-            budgets = get_budgets(chat_id)
-            total_budget = sum(budgets.values())
-            pct = (spent/total_budget*100) if total_budget else 0
-            grade, grade_msg = get_grade(pct/100 if total_budget else 0)
-            text = (f"📅 *Weekly Digest — {month_label()}*\n"
-                    f"{'─'*28}\n"
-                    f"Grade so far: *{grade}* {grade_msg}\n\n"
-                    f"💵 Income:  {fmt(income)}\n"
-                    f"💸 Spent:   {fmt(spent)}\n"
-                    f"💰 Left:    *{fmt(income-spent)}*\n")
-            if total_budget:
-                text += f"\n{budget_status(pct)} `{progress_bar(pct,12)}` {pct:.0f}% of budget used\n"
+            month=get_month(); income,spent,by_cat=calc_summary(chat_id,month)
+            budgets=get_budgets(chat_id); total_budget=sum(budgets.values())
+            pct=(spent/total_budget*100) if total_budget else 0; grade,grade_msg=get_grade(pct/100 if total_budget else 0)
+            text=(f"📅 *Weekly Digest — {month_label()}*\n{'-'*28}\nGrade so far: *{grade}* {grade_msg}\n\n"
+                  f"💵 Income:  {fmt(income)}\n💸 Spent:   {fmt(spent)}\n💰 Left:    *{fmt(income-spent)}*\n")
+            if total_budget: text+=f"\n{budget_status(pct)} `{progress_bar(pct,12)}` {pct:.0f}% of budget used\n"
             if by_cat:
-                top = sorted(by_cat.items(), key=lambda x:-x[1])[:3]
-                text += "\n*Top spending:*\n"
-                for cat, amt in top:
-                    text += f"{CAT_ICONS.get(cat,'•')} {cat}: {fmt(amt)}\n"
-            text += "\n_Type /report for full breakdown_"
-            await app.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
-        except Exception as e:
-            print(f"Weekly digest error for {chat_id}: {e}")
+                text+="\n*Top spending:*\n"
+                for cat,amt in sorted(by_cat.items(),key=lambda x:-x[1])[:3]:
+                    text+=f"{CAT_ICONS.get(cat,chr(8226))} {cat}: {fmt(amt)}\n"
+            text+="\n_Type /report for full breakdown_"
+            await app.bot.send_message(chat_id=chat_id,text=text,parse_mode="Markdown")
+        except Exception as e: print(f"Weekly digest error for {chat_id}: {e}")
 
 async def process_recurring(app):
-    today = datetime.now()
-    chats = get_all_chats()
-    for chat_id in chats:
-        recurrings = get_recurring(chat_id)
-        for r in recurrings:
-            if r[5] == today.day:
-                date = today.strftime("%Y-%m-%d")
-                tx_info = add_tx(chat_id, "expense", r[2], r[3], r[4], date, "Auto")
-                # Use create_task here consistently (was incorrectly awaited before)
-                asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-                icon = CAT_ICONS.get(r[4],"•")
+    today=datetime.now()
+    for chat_id in get_all_chats():
+        for r in get_recurring(chat_id):
+            if r[5]==today.day:
+                date=today.strftime("%Y-%m-%d")
+                tx_info=add_tx(chat_id,"expense",r[2],r[3],r[4],date,"Auto")
+                asyncio.create_task(gs_sync_async(chat_id,*tx_info))
                 try:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🔁 *Recurring expense logged!*\n\n{icon} *{r[4]}*\n💸 {fmt(r[2])} — {r[3]}",
-                        parse_mode="Markdown"
-                    )
-                except Exception as e:
-                    print(f"Recurring error: {e}")
+                    await app.bot.send_message(chat_id=chat_id,
+                        text=f"🔁 *Recurring logged!*\n\n{CAT_ICONS.get(r[4],chr(8226))} *{r[4]}*\n💸 {fmt(r[2])} — {r[3]}",
+                        parse_mode="Markdown")
+                except Exception as e: print(f"Recurring error: {e}")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    if not TOKEN:
-        print("ERROR: BOT_TOKEN not set!"); return
+    if not TOKEN: print("ERROR: BOT_TOKEN not set!"); return
     print(f"Starting... token: {TOKEN[:10]}")
     print(f"DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
     init_db()
     try:
-        app = Application.builder().token(TOKEN).build()
-
-        app.add_handler(CommandHandler("start", start))
-        app.add_handler(CommandHandler("help", help_cmd))
-        app.add_handler(CommandHandler("add", add_expense))
-        app.add_handler(CommandHandler("income", add_income))
-        app.add_handler(CommandHandler("summary", summary))
-        app.add_handler(CommandHandler("spent", spent_cmd))
-        app.add_handler(CommandHandler("report", report_cmd))
-        app.add_handler(CommandHandler("recent", recent))
-        app.add_handler(CommandHandler("delete", delete_cmd))
-        app.add_handler(CommandHandler("budget", budget_cmd))
-        app.add_handler(CommandHandler("budgets", budgets_cmd))
-        app.add_handler(CommandHandler("recurring", recurring_cmd))
-        app.add_handler(CommandHandler("month", month_cmd))
-        app.add_handler(CommandHandler("daily", daily_cmd))
-        app.add_handler(CommandHandler("refreshsheets", refresh_sheets_cmd))
-
-        app.add_handler(CallbackQueryHandler(delete_callback, pattern="^del_"))
-        app.add_handler(CallbackQueryHandler(quickcat_callback, pattern="^quickcat_"))
-        app.add_handler(CallbackQueryHandler(budcat_callback, pattern="^budcat_"))
-        app.add_handler(CallbackQueryHandler(delrec_callback, pattern="^delrec_"))
-        app.add_handler(CallbackQueryHandler(daily_callback, pattern="^daily_"))
-
-        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_keyboard))
-        app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
-        scheduler = AsyncIOScheduler()
-        scheduler.add_job(weekly_digest, 'cron', day_of_week='sun', hour=9, minute=0, args=[app])
-        scheduler.add_job(process_recurring, 'cron', hour=8, minute=0, args=[app])
+        app=Application.builder().token(TOKEN).build()
+        app.add_handler(CommandHandler("start",start))
+        app.add_handler(CommandHandler("help",help_cmd))
+        app.add_handler(CommandHandler("add",add_expense))
+        app.add_handler(CommandHandler("income",add_income))
+        app.add_handler(CommandHandler("summary",summary))
+        app.add_handler(CommandHandler("spent",spent_cmd))
+        app.add_handler(CommandHandler("report",report_cmd))
+        app.add_handler(CommandHandler("recent",recent))
+        app.add_handler(CommandHandler("delete",delete_cmd))
+        app.add_handler(CommandHandler("budget",budget_cmd))
+        app.add_handler(CommandHandler("budgets",budgets_cmd))
+        app.add_handler(CommandHandler("recurring",recurring_cmd))
+        app.add_handler(CommandHandler("month",month_cmd))
+        app.add_handler(CommandHandler("daily",daily_cmd))
+        app.add_handler(CommandHandler("refreshsheets",refresh_sheets_cmd))
+        app.add_handler(CommandHandler("who",who_cmd))
+        app.add_handler(CallbackQueryHandler(delete_callback,pattern="^del_"))
+        app.add_handler(CallbackQueryHandler(quickcat_callback,pattern="^quickcat_"))
+        app.add_handler(CallbackQueryHandler(budcat_callback,pattern="^budcat_"))
+        app.add_handler(CallbackQueryHandler(delrec_callback,pattern="^delrec_"))
+        app.add_handler(CallbackQueryHandler(daily_callback,pattern="^daily_"))
+        app.add_handler(MessageHandler(filters.PHOTO,handle_photo))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_reply_keyboard))
+        app.add_handler(MessageHandler(filters.COMMAND,unknown))
+        scheduler=AsyncIOScheduler()
+        scheduler.add_job(weekly_digest,"cron",day_of_week="sun",hour=9,minute=0,args=[app])
+        scheduler.add_job(process_recurring,"cron",hour=8,minute=0,args=[app])
         scheduler.start()
-
         print("🤖 Budget bot is running!")
         app.run_polling(drop_pending_updates=True)
     except Exception as e:
         print(f"FATAL ERROR: {e}")
         import traceback; traceback.print_exc(); raise
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
