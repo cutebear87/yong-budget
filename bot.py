@@ -1,4 +1,4 @@
-import os, sqlite3, re, base64, httpx, asyncio, json, time
+import os, sqlite3, re, base64, httpx, asyncio, json, time, difflib
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
@@ -21,16 +21,30 @@ CAT_ICONS = {
     "Entertainment":"🎬","Savings":"💰","Personal/Shopping":"🛍","Income":"💵"
 }
 CAT_KEYWORDS = {
-    "Groceries":["grocery","groceries","supermarket","market","fairprice","ntuc","cold storage","giant","trader","walmart","costco","food","lunch","dinner","breakfast","meal","supper"],
-    "Dining Out":["dining","restaurant","cafe","coffee","starbucks","mcdonald","burger","pizza","sushi","hawker","kopitiam","grab food","deliveroo","foodpanda","nobu","brunch"],
-    "Transportation":["grab","taxi","uber","mrt","bus","transport","petrol","gas","parking","ez-link","train","gojek","car"],
-    "Subscriptions":["netflix","spotify","apple","google","subscription","sub","amazon prime","youtube","disney","hulu"],
-    "Entertainment":["movie","cinema","concert","game","shopping","mall","entertainment"],
-    "Utilities":["electric","water","internet","phone","bill","utility","telco","singtel","starhub","m1"],
-    "Housing/Rent":["rent","mortgage","condo","hdb","housing","property"],
-    "Savings":["savings","save","investment","invest","cpf"],
-    "Personal/Shopping":["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon"],
+    "Groceries":["grocery","groceries","supermarket","fairprice","ntuc","cold storage","giant","walmart","costco"],
+    "Dining Out":["dining","restaurant","cafe","coffee","starbucks","mcdonald","burger","pizza","sushi","hawker",
+                  "kopitiam","deliveroo","foodpanda","nobu","brunch","lunch","dinner","breakfast","meal","supper",
+                  "grab food","grabfood","eatery","bistro","ramen","pho","bak kut"],
+    "Transportation":["grab","taxi","uber","mrt","bus","transport","petrol","gas","parking","ez-link","train","gojek","car","lyft","commute"],
+    "Subscriptions":["netflix","spotify","apple","google","subscription","sub","amazon prime","youtube","disney","hulu","paramount","icloud"],
+    "Entertainment":["movie","cinema","concert","game","entertainment","arcade","bowling","escape room","museum","zoo","theme park"],
+    "Utilities":["electric","water","internet","phone","bill","utility","telco","singtel","starhub","m1","electricity","sp group"],
+    "Housing/Rent":["rent","mortgage","condo","hdb","housing","property","maintenance","strata"],
+    "Savings":["savings","save","investment","invest","cpf","srs","endowment","stocks","etf"],
+    "Personal/Shopping":["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon","taobao","uniqlo","zara","h&m"],
 }
+
+# Keywords with strong category signal but lower weight (generic food terms)
+CAT_KEYWORDS_LOW = {
+    "Groceries": ["food","market","fresh","produce"],
+}
+
+# Keywords that suggest a message is income rather than an expense
+INCOME_KEYWORDS = [
+    "salary","paycheck","payday","pay","wage","bonus","dividend","refund",
+    "reimbursement","allowance","freelance","invoice","transfer in","received",
+    "commission","interest","cashback","rebate","income"
+]
 
 
 def get_conn():
@@ -47,6 +61,14 @@ def init_db():
     cur.execute("""CREATE TABLE IF NOT EXISTS budgets (chat_id TEXT, category TEXT, amount REAL, PRIMARY KEY (chat_id, category))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS recurring (id BIGINT PRIMARY KEY, chat_id TEXT, amount REAL, description TEXT, category TEXT, day_of_month INTEGER)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS settings (chat_id TEXT PRIMARY KEY, weekly_digest BOOLEAN DEFAULT TRUE, alert_threshold REAL DEFAULT 0.8)""")
+    # ── NEW: stores user-confirmed description→category mappings ──────────────
+    cur.execute("""CREATE TABLE IF NOT EXISTS learned_mappings (
+        chat_id TEXT,
+        keyword TEXT,
+        category TEXT,
+        count INTEGER DEFAULT 1,
+        PRIMARY KEY (chat_id, keyword)
+    )""")
     conn.commit(); conn.close(); print("Database initialized OK.")
 
 def get_txs(chat_id, month=None):
@@ -116,6 +138,37 @@ def get_all_chats():
     cur.execute("SELECT DISTINCT chat_id FROM transactions")
     rows = cur.fetchall(); conn.close(); return [r[0] for r in rows]
 
+# ── LEARNED MAPPINGS ──────────────────────────────────────────────────────────
+
+def get_learned_mappings(chat_id):
+    """Return {keyword: category} dict for this chat."""
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    cur.execute(f"SELECT keyword, category FROM learned_mappings WHERE chat_id={p} ORDER BY count DESC", (chat_id,))
+    rows = cur.fetchall(); conn.close()
+    return {r[0]: r[1] for r in rows}
+
+def save_learned_mapping(chat_id, desc, category):
+    """
+    Normalise the description to keywords and upsert into learned_mappings.
+    We store the full normalised description as the key (simple but effective).
+    """
+    keyword = desc.lower().strip()
+    if not keyword: return
+    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
+    if t == "pg":
+        cur.execute(
+            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) VALUES ({p},{p},{p},1) "
+            f"ON CONFLICT (chat_id,keyword) DO UPDATE SET category={p}, count=learned_mappings.count+1",
+            (chat_id, keyword, category, category)
+        )
+    else:
+        cur.execute(
+            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) VALUES ({p},{p},{p},1) "
+            f"ON CONFLICT(chat_id,keyword) DO UPDATE SET category={p}, count=count+1",
+            (chat_id, keyword, category, category)
+        )
+    conn.commit(); conn.close()
+
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
 _gs_client = None
@@ -126,12 +179,6 @@ SHEET_BUDGET = "Budget Tracker"
 SHEET_SUM    = "Summary"
 SHEET_DASH   = "Dashboard"
 
-# Budget Tracker column layout (never change order — charts reference by column):
-# A=Category  B=Budget  C=Spent  D=Remaining  E=Progress Bar  F=%Used  G=Status
-# Chart ranges to use in Sheets:
-#   Donut (spending by cat) : Budget Tracker!A2:A10, Budget Tracker!C2:C10
-#   Bar (spent vs budget)   : Budget Tracker!A2:C10
-#   Line (3-month trend)    : Summary!A:D
 BUD_HEADERS = ["Category","Budget","Spent","Remaining","Progress","% Used","Status"]
 TX_HEADERS  = ["ID","Date","Month","Type","Amount","Category","Description","Added By"]
 SUM_HEADERS = ["Category","Jan Spent","Feb Spent","Mar Spent","3-Month Avg","Trend"]
@@ -195,22 +242,11 @@ def _ensure_sheets(spreadsheet):
 
 
 def gs_refresh_budget(spreadsheet, chat_id, month):
-    """
-    Writes Budget Tracker with ALL 9 categories in fixed order.
-    Layout (chart-stable):
-      Row 1  : Header
-      Rows 2-10 : One row per category (always all 9, even if $0 spent)
-      Row 11 : Blank spacer (keeps TOTAL out of chart range A2:C10)
-      Row 12 : TOTAL row
-    Your chart ranges to set in Sheets:
-      Donut  -> A2:A10, C2:C10
-      Bar    -> A2:C10
-    """
     budgets      = get_budgets(chat_id)
     _, _, by_cat = calc_summary(chat_id, month)
     ws           = _get_or_create_ws(spreadsheet, SHEET_BUDGET, BUD_HEADERS)
     sid          = ws.id
-    n = len(CATS)  # always 9
+    n = len(CATS)
 
     data_rows  = []
     row_colors = []
@@ -251,8 +287,6 @@ def gs_refresh_budget(spreadsheet, chat_id, month):
 
 
 def gs_refresh_summary(spreadsheet, chat_id):
-    """Summary sheet: categories as rows, last 3 months as columns.
-    Point your line chart at Summary!A:D for the 3-month trend."""
     month   = get_month()
     dt      = datetime.strptime(month, "%Y-%m")
     months  = [(dt-timedelta(days=30*i)).strftime("%Y-%m") for i in range(2,-1,-1)]
@@ -379,12 +413,6 @@ def budget_status(pct):
     if pct>=80:  return "🟡"
     return "🟢"
 
-def guess_category(text):
-    tl = text.lower()
-    for cat, kws in CAT_KEYWORDS.items():
-        if any(kw in tl for kw in kws): return cat
-    return None
-
 def get_grade(pct_used):
     if pct_used<=0.7:  return "A","🌟 Excellent!"
     if pct_used<=0.85: return "B","👍 Good job!"
@@ -401,6 +429,299 @@ def main_keyboard():
         [KeyboardButton("❓ Help"),     KeyboardButton("🔄 Sheets")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
+
+
+# ── IMPROVED CATEGORY GUESSING ────────────────────────────────────────────────
+
+def _is_income_desc(desc: str) -> bool:
+    """Return True if the description sounds like income rather than an expense."""
+    tl = desc.lower()
+    return any(kw in tl for kw in INCOME_KEYWORDS)
+
+def _score_categories(desc: str) -> dict:
+    """
+    Return a score dict {category: score} using keyword matching + fuzzy matching.
+    High-confidence keywords score 3; low-confidence (generic) keywords score 1;
+    fuzzy matches score 1. Higher total = stronger match.
+    """
+    tl = desc.lower()
+    words = re.findall(r'\w+', tl)
+    scores = {cat: 0 for cat in CATS}
+
+    for cat, kws in CAT_KEYWORDS.items():
+        for kw in kws:
+            # Exact substring match — high confidence
+            if kw in tl:
+                scores[cat] += 3
+                continue
+            # Fuzzy word-level match — catches typos like "resturant"
+            for word in words:
+                ratio = difflib.SequenceMatcher(None, word, kw).ratio()
+                if ratio >= 0.82:          # ~1-2 character difference
+                    scores[cat] += 2
+
+    # Low-weight generic keywords (e.g. "food" could be Groceries OR Dining Out)
+    for cat, kws in CAT_KEYWORDS_LOW.items():
+        for kw in kws:
+            if kw in tl:
+                scores[cat] += 1
+
+    return scores
+
+def guess_category(desc: str, learned: dict | None = None) -> str | None:
+    """
+    Improved category guesser. Priority order:
+      1. Exact learned mapping (user-confirmed before)
+      2. Fuzzy learned mapping (close match to a learned key)
+      3. Multi-score keyword matching
+    Returns None if no confident guess.
+    """
+    tl = desc.lower().strip()
+
+    # 1. Exact learned mapping
+    if learned:
+        if tl in learned:
+            return learned[tl]
+
+        # 2. Fuzzy match against learned keys
+        close = difflib.get_close_matches(tl, learned.keys(), n=1, cutoff=0.80)
+        if close:
+            return learned[close[0]]
+
+    # 3. Multi-category keyword scoring
+    scores = _score_categories(desc)
+    best_cat  = max(scores, key=scores.get)
+    best_score = scores[best_cat]
+
+    if best_score == 0:
+        return None  # No match at all → ask the user
+
+    # If the best score is low and there's a tie, don't guess — ask instead
+    top_two = sorted(scores.values(), reverse=True)[:2]
+    if best_score < 2 and len(top_two) > 1 and top_two[0] == top_two[1]:
+        return None
+
+    return best_cat
+
+async def claude_categorise(desc: str) -> str | None:
+    """
+    Ask Claude to categorise a description when keyword matching fails.
+    Returns a category string or None on error.
+    Falls back gracefully — never blocks the user flow.
+    """
+    if not ANTHROPIC_API_KEY:
+        return None
+    valid_cats = ", ".join(CATS)
+    payload = {
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 50,
+        "messages": [{
+            "role": "user",
+            "content": (
+                f"Categorise this personal finance expense into exactly one of these categories: {valid_cats}.\n"
+                f"Expense description: \"{desc}\"\n"
+                f"Reply with ONLY the category name, nothing else."
+            )
+        }]
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                json=payload
+            )
+            if r.status_code != 200:
+                return None
+            text = r.json()["content"][0]["text"].strip()
+            # Validate the response is actually one of our categories
+            for cat in CATS:
+                if cat.lower() == text.lower():
+                    return cat
+            # Partial match fallback
+            for cat in CATS:
+                if cat.lower() in text.lower() or text.lower() in cat.lower():
+                    return cat
+            return None
+    except Exception as e:
+        print(f"Claude categorise error: {e}")
+        return None
+
+
+# ── SMART ADD ────────────────────────────────────────────────────────────────
+
+async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    # Support "income 5000 salary" prefix
+    income_prefix = re.match(r'^income\s+(\d+\.?\d*)\s*(.*)$', text, re.IGNORECASE)
+    if income_prefix:
+        try: amount = float(income_prefix.group(1))
+        except: return
+        desc = income_prefix.group(2).strip() or "Income"
+        chat_id = str(update.effective_chat.id)
+        added_by = update.effective_user.first_name or "Someone"
+        date = datetime.now().strftime("%Y-%m-%d")
+        tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
+        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        await update.message.reply_text(
+            f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Standard "amount description" pattern
+    match = re.match(r'^(\d+\.?\d*)\s+(.+)$', text)
+    if not match:
+        return
+    try:
+        amount = float(match.group(1))
+        desc   = match.group(2).strip()
+    except:
+        return
+
+    chat_id  = str(update.effective_chat.id)
+    added_by = update.effective_user.first_name or "Someone"
+
+    # Detect income from description keywords
+    if _is_income_desc(desc):
+        date = datetime.now().strftime("%Y-%m-%d")
+        tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
+        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        await update.message.reply_text(
+            f"✅ *Income logged!* 💵\n\n*{fmt(amount)}* — {desc}\n👤 {added_by}\n\n"
+            f"_Was this actually an expense? Use /delete then /add_",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Load learned mappings for this chat
+    learned = get_learned_mappings(chat_id)
+
+    # Try local guessing first (fast, free)
+    guessed_cat = guess_category(desc, learned)
+
+    # Fall back to Claude if no confident local guess
+    used_claude = False
+    if guessed_cat is None and ANTHROPIC_API_KEY:
+        guessed_cat = await claude_categorise(desc)
+        used_claude = True
+
+    if guessed_cat:
+        date    = datetime.now().strftime("%Y-%m-%d")
+        tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
+        asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+        tx_id = tx_info[0]
+        icon  = CAT_ICONS.get(guessed_cat, "•")
+        ai_tag = " 🤖" if used_claude else ""
+
+        keyboard = []; row = []
+        for cat in CATS:
+            row.append(InlineKeyboardButton(
+                f"{CAT_ICONS.get(cat, chr(8226))} {cat.split('/')[0]}",
+                callback_data=f"quickcat_{tx_id}_{cat}"
+            ))
+            if len(row) == 2: keyboard.append(row); row = []
+        if row: keyboard.append(row)
+
+        await update.message.reply_text(
+            f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat}{ai_tag} · {fmt(amount)}\n_Tap to change category_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        await check_budget_alert(update, ctx, chat_id, guessed_cat)
+    else:
+        # No guess — show category picker without logging yet
+        keyboard = []; row = []
+        for cat in CATS:
+            row.append(InlineKeyboardButton(
+                f"{CAT_ICONS.get(cat, chr(8226))} {cat.split('/')[0]}",
+                callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"
+            ))
+            if len(row) == 2: keyboard.append(row); row = []
+        if row: keyboard.append(row)
+        await update.message.reply_text(
+            f"💸 *{fmt(amount)}* — _{desc}_\nWhich category?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    chat_id = str(update.effective_chat.id)
+    parts = query.data.replace("quickcat_", "").split("_")
+    updated_cat = "_".join(parts[1:]) if parts else ""
+    try: maybe_id = int(parts[0])
+    except: maybe_id = None
+
+    if maybe_id is not None and updated_cat in CATS:
+        # Updating category of an already-logged transaction
+        tx = get_tx(maybe_id, chat_id)
+        if not tx:
+            await query.edit_message_text("⚠️ Couldn't find that transaction.", parse_mode="Markdown")
+            return
+        update_tx_category(maybe_id, chat_id, updated_cat)
+        asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
+        icon = CAT_ICONS.get(updated_cat, "•")
+
+        # ── Learn from this correction ────────────────────────────────────────
+        save_learned_mapping(chat_id, tx[4], updated_cat)   # tx[4] = description
+        # ─────────────────────────────────────────────────────────────────────
+
+        await query.edit_message_text(
+            f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(tx[3])} — {tx[4]}\n👤 {tx[7]}",
+            parse_mode="Markdown"
+        )
+        await check_budget_alert_query(query, ctx, chat_id, updated_cat)
+        return
+
+    # Logging a new transaction (category was unknown)
+    amount  = float(parts[0])
+    desc    = parts[1]
+    cat     = "_".join(parts[2:])
+
+    for t in get_txs(chat_id):
+        if t[3] == amount and t[4] == desc:
+            del_tx(t[0], chat_id)
+            asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
+            break
+
+    date     = datetime.now().strftime("%Y-%m-%d")
+    added_by = update.effective_user.first_name or "Someone"
+    tx_info  = add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
+    asyncio.create_task(gs_sync_async(chat_id, *tx_info))
+
+    # ── Learn from explicit user selection ───────────────────────────────────
+    save_learned_mapping(chat_id, desc, cat)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    icon = CAT_ICONS.get(cat, "•")
+    await query.edit_message_text(
+        f"✅ *Logged!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}",
+        parse_mode="Markdown"
+    )
+    await check_budget_alert_query(query, ctx, chat_id, cat)
+
+
+async def check_budget_alert(update, ctx, chat_id, cat):
+    budgets = get_budgets(chat_id); bud = budgets.get(cat, 0)
+    if not bud: return
+    _, _, by_cat = calc_summary(chat_id); spent = by_cat.get(cat, 0); pct = spent / bud
+    if 0.8 <= pct < 0.82:
+        await update.message.reply_text(
+            f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat, chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",
+            parse_mode="Markdown"
+        )
+
+async def check_budget_alert_query(query, ctx, chat_id, cat):
+    budgets = get_budgets(chat_id); bud = budgets.get(cat, 0)
+    if not bud: return
+    _, _, by_cat = calc_summary(chat_id); spent = by_cat.get(cat, 0); pct = spent / bud
+    if 0.8 <= pct < 0.82:
+        await query.message.reply_text(
+            f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat, chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",
+            parse_mode="Markdown"
+        )
 
 
 async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
@@ -460,76 +781,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await scanning_msg.edit_text("😕 Something went wrong. Try: `amount description`",parse_mode="Markdown")
 
 
-async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text=update.message.text.strip()
-    match=re.match(r'^(\d+\.?\d*)\s+(.+)$',text)
-    if not match: return
-    try: amount=float(match.group(1)); desc=match.group(2).strip()
-    except: return
-    chat_id=str(update.effective_chat.id); guessed_cat=guess_category(desc)
-    if guessed_cat:
-        date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
-        tx_info=add_tx(chat_id,"expense",amount,desc,guessed_cat,date,added_by)
-        asyncio.create_task(gs_sync_async(chat_id,*tx_info)); tx_id=tx_info[0]
-        icon=CAT_ICONS.get(guessed_cat,"•")
-        keyboard=[]; row=[]
-        for cat in CATS:
-            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{tx_id}_{cat}"))
-            if len(row)==2: keyboard.append(row); row=[]
-        if row: keyboard.append(row)
-        await update.message.reply_text(f"✅ *Logged!* _{desc}_\n{icon} {guessed_cat} · {fmt(amount)}\n_Tap to change category_",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
-        await check_budget_alert(update,ctx,chat_id,guessed_cat)
-    else:
-        keyboard=[]; row=[]
-        for cat in CATS:
-            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"))
-            if len(row)==2: keyboard.append(row); row=[]
-        if row: keyboard.append(row)
-        await update.message.reply_text(f"💸 *{fmt(amount)}* — _{desc}_\nWhich category?",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query=update.callback_query; await query.answer()
-    chat_id=str(update.effective_chat.id)
-    parts=query.data.replace("quickcat_","").split("_"); updated_cat="_".join(parts[1:]) if parts else ""
-    try: maybe_id=int(parts[0])
-    except: maybe_id=None
-    if maybe_id is not None and updated_cat in CATS:
-        tx=get_tx(maybe_id,chat_id)
-        if not tx: await query.edit_message_text("⚠️ Couldn't find that transaction.",parse_mode="Markdown"); return
-        update_tx_category(maybe_id,chat_id,updated_cat)
-        asyncio.create_task(gs_sync_async(chat_id,tx_id=maybe_id,cat=updated_cat,update_category=True))
-        icon=CAT_ICONS.get(updated_cat,"•")
-        await query.edit_message_text(f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(tx[3])} — {tx[4]}\n👤 {tx[7]}",parse_mode="Markdown")
-        await check_budget_alert_query(query,ctx,chat_id,updated_cat); return
-    amount=float(parts[0]); desc=parts[1]; cat="_".join(parts[2:])
-    for t in get_txs(chat_id):
-        if t[3]==amount and t[4]==desc:
-            del_tx(t[0],chat_id); asyncio.create_task(gs_sync_async(chat_id,tx_id=t[0],delete=True)); break
-    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
-    tx_info=add_tx(chat_id,"expense",amount,desc,cat,date,added_by)
-    asyncio.create_task(gs_sync_async(chat_id,*tx_info)); icon=CAT_ICONS.get(cat,"•")
-    await query.edit_message_text(f"✅ *Updated!*\n{icon} *{cat}*\n💸 {fmt(amount)} — {desc}\n👤 {added_by}",parse_mode="Markdown")
-    await check_budget_alert_query(query,ctx,chat_id,cat)
-
-async def check_budget_alert(update, ctx, chat_id, cat):
-    budgets=get_budgets(chat_id); bud=budgets.get(cat,0)
-    if not bud: return
-    _,_,by_cat=calc_summary(chat_id); spent=by_cat.get(cat,0); pct=spent/bud
-    if 0.8<=pct<0.82:
-        await update.message.reply_text(f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat,chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",parse_mode="Markdown")
-
-async def check_budget_alert_query(query, ctx, chat_id, cat):
-    budgets=get_budgets(chat_id); bud=budgets.get(cat,0)
-    if not bud: return
-    _,_,by_cat=calc_summary(chat_id); spent=by_cat.get(cat,0); pct=spent/bud
-    if 0.8<=pct<0.82:
-        await query.message.reply_text(f"⚠️ *Budget Alert!*\n\n{CAT_ICONS.get(cat,chr(8226))} {cat} is at *{pct*100:.0f}%* of your {fmt(bud)} budget.\n_{fmt(bud-spent)} remaining_",parse_mode="Markdown")
-
-
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Welcome to Yong's Budget Bot!*\n\nTrack your family spending together 💑\n\n"
         "*✨ Quick tip:* Just type amount + description:\ne.g. `45.50 dinner at nobu` or `120 grab`\n\n"
+        "*Log income:* `income 5000 salary` or `5000 salary`\n\n"
         "*Commands:*\n"
         "➕ `/add 45.50 dining dinner` — log expense\n"
         "➕ `/income 5000 paycheck` — log income\n"
@@ -549,7 +805,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *All Commands*\n\n"
-        "*Smart add:* `45.50 dinner at nobu`\n\n"
+        "*Smart add:* `45.50 dinner at nobu`\n"
+        "*Smart income:* `income 5000 salary` or `5000 paycheck`\n\n"
         "*Logging:*\n`/add <amount> <category> <desc>`\n`/income <amount> <desc>`\n\n"
         "*Viewing:*\n`/summary` · `/spent` · `/report` · `/recent` · `/daily` · `/month YYYY-MM`\n\n"
         "*Budgets:*\n`/budget <category> <amount>` · `/budgets`\n\n"
@@ -837,7 +1094,6 @@ async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
 
 async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show spending breakdown by person for the current month."""
     chat_id = str(update.effective_chat.id)
     month   = get_month()
     txs     = get_txs(chat_id, month)
@@ -850,13 +1106,12 @@ async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Aggregate by person
     by_person = {}
     by_person_cat = {}
     total_spent = sum(t[3] for t in expenses)
 
     for t in expenses:
-        person = t[7]  # added_by
+        person = t[7]
         amount = t[3]
         cat    = t[5]
         by_person[person]          = by_person.get(person, 0) + amount
@@ -864,7 +1119,6 @@ async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             by_person_cat[person]  = {}
         by_person_cat[person][cat] = by_person_cat[person].get(cat, 0) + amount
 
-    # Sort people by spend descending
     ranked = sorted(by_person.items(), key=lambda x: -x[1])
 
     text = f"\U0001f46b *Who spent what — {month_label()}*\n{'─'*28}\n\n"
@@ -878,14 +1132,12 @@ async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text  += f"{medal} *{person}*\n"
         text  += f"`{bar}` {fmt(amount)} ({pct}%)\n"
 
-        # Top 3 categories for this person
         cats = sorted(by_person_cat[person].items(), key=lambda x: -x[1])[:3]
         for cat, amt in cats:
             icon  = CAT_ICONS.get(cat, "•")
             text += f"  {icon} {cat}: {fmt(amt)}\n"
         text += "\n"
 
-    # Fun stat — most expensive single transaction
     priciest = max(expenses, key=lambda t: t[3])
     icon = CAT_ICONS.get(priciest[5], "•")
     text += f"{'─'*28}\n"
