@@ -47,127 +47,257 @@ INCOME_KEYWORDS = [
 ]
 
 
-def get_conn():
-    if DATABASE_URL:
-        import psycopg2
-        return psycopg2.connect(DATABASE_URL.replace("postgres://","postgresql://",1)), "pg"
-    return sqlite3.connect("budget.db"), "sqlite"
+# ── CONNECTION POOL ───────────────────────────────────────────────────────────
+# Neon free tier: 10 connections max.
+# We use 1–3 so the rest stay available for Neon's own overhead + future use.
+# SQLite uses a single persistent connection (no pool needed).
 
-def ph(t): return "%s" if t=="pg" else "?"
+_sqlite_conn = None   # reused for the lifetime of the process
+_pg_pool     = None   # psycopg2 ThreadedConnectionPool
+_DB_TYPE     = "sqlite"
+
+def _init_pool():
+    """Called once at startup from init_db(). Sets up the right backend."""
+    global _sqlite_conn, _pg_pool, _DB_TYPE
+    if DATABASE_URL:
+        import psycopg2.pool
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=3,   # safe for Neon free tier (limit is 10)
+            dsn=DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        )
+        _DB_TYPE = "pg"
+        print("PostgreSQL pool initialised (1–3 connections, Neon-safe)")
+    else:
+        _sqlite_conn = sqlite3.connect("budget.db", check_same_thread=False)
+        _sqlite_conn.isolation_level = None   # autocommit mode
+        _DB_TYPE = "sqlite"
+        print("SQLite connection initialised")
+
+def _get_conn():
+    """
+    Borrow a connection from the pool (Postgres) or return the
+    shared SQLite connection. Always pair with _release_conn().
+    """
+    if _pg_pool:
+        return _pg_pool.getconn(), True
+    return _sqlite_conn, False
+
+def _release_conn(conn, pooled: bool):
+    """Return a Postgres connection to the pool. No-op for SQLite."""
+    if pooled and _pg_pool:
+        _pg_pool.putconn(conn)
+
+def ph(): return "%s" if _DB_TYPE == "pg" else "?"
+
+# ── DB HELPERS ────────────────────────────────────────────────────────────────
+
+def _execute(query: str, params: tuple = (), *, fetch: str = "none"):
+    """
+    Central query runner. Borrows a connection, runs the query,
+    releases back to pool in finally block, returns rows or None.
+
+    fetch: "none" | "one" | "all"
+    Writes (INSERT/UPDATE/DELETE) are committed automatically.
+    """
+    conn, pooled = _get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        if fetch == "all":
+            return cur.fetchall()
+        if fetch == "one":
+            return cur.fetchone()
+        # write — commit for SQLite (Postgres autocommits via pool default)
+        if _DB_TYPE == "sqlite":
+            conn.commit()
+        else:
+            conn.commit()
+        return None
+    except Exception as e:
+        print(f"DB error: {e}\nQuery: {query}\nParams: {params}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        _release_conn(conn, pooled)
 
 def init_db():
-    conn, db_type = get_conn(); cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS transactions (id BIGINT PRIMARY KEY, chat_id TEXT, type TEXT, amount REAL, description TEXT, category TEXT, date TEXT, added_by TEXT, month TEXT)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS budgets (chat_id TEXT, category TEXT, amount REAL, PRIMARY KEY (chat_id, category))""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS recurring (id BIGINT PRIMARY KEY, chat_id TEXT, amount REAL, description TEXT, category TEXT, day_of_month INTEGER)""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS settings (chat_id TEXT PRIMARY KEY, weekly_digest BOOLEAN DEFAULT TRUE, alert_threshold REAL DEFAULT 0.8)""")
-    # ── NEW: stores user-confirmed description→category mappings ──────────────
-    cur.execute("""CREATE TABLE IF NOT EXISTS learned_mappings (
-        chat_id TEXT,
-        keyword TEXT,
-        category TEXT,
+    """Create tables, indexes, and initialise the connection pool."""
+    _init_pool()
+    p = ph()
+
+    # Tables
+    _execute("""CREATE TABLE IF NOT EXISTS transactions (
+        id BIGINT PRIMARY KEY, chat_id TEXT, type TEXT, amount REAL,
+        description TEXT, category TEXT, date TEXT, added_by TEXT, month TEXT
+    )""")
+    _execute("""CREATE TABLE IF NOT EXISTS budgets (
+        chat_id TEXT, category TEXT, amount REAL,
+        PRIMARY KEY (chat_id, category)
+    )""")
+    _execute("""CREATE TABLE IF NOT EXISTS recurring (
+        id BIGINT PRIMARY KEY, chat_id TEXT, amount REAL,
+        description TEXT, category TEXT, day_of_month INTEGER
+    )""")
+    _execute("""CREATE TABLE IF NOT EXISTS settings (
+        chat_id TEXT PRIMARY KEY,
+        weekly_digest BOOLEAN DEFAULT TRUE,
+        alert_threshold REAL DEFAULT 0.8
+    )""")
+    _execute("""CREATE TABLE IF NOT EXISTS learned_mappings (
+        chat_id TEXT, keyword TEXT, category TEXT,
         count INTEGER DEFAULT 1,
         PRIMARY KEY (chat_id, keyword)
     )""")
-    conn.commit(); conn.close(); print("Database initialized OK.")
+
+    # Indexes — speeds up the most common query patterns
+    _execute("CREATE INDEX IF NOT EXISTS idx_tx_chat_month ON transactions(chat_id, month)")
+    _execute("CREATE INDEX IF NOT EXISTS idx_tx_chat_date  ON transactions(chat_id, date)")
+    _execute("CREATE INDEX IF NOT EXISTS idx_learned_chat  ON learned_mappings(chat_id)")
+
+    print("Database initialised OK.")
+
+# ── TRANSACTION FUNCTIONS ─────────────────────────────────────────────────────
 
 def get_txs(chat_id, month=None):
     month = month or get_month()
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE chat_id={p} AND month={p} ORDER BY date DESC, id DESC", (chat_id, month))
-    rows = cur.fetchall(); conn.close(); return rows
+    p = ph()
+    rows = _execute(
+        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
+        f"FROM transactions WHERE chat_id={p} AND month={p} "
+        f"ORDER BY date DESC, id DESC",
+        (chat_id, month), fetch="all"
+    )
+    return rows or []
 
 def add_tx(chat_id, type_, amount, desc, cat, date, added_by):
-    month = date[:7]; tx_id = int(datetime.now().timestamp()*1000)
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"INSERT INTO transactions (id,chat_id,type,amount,description,category,date,added_by,month) VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})", (tx_id,chat_id,type_,amount,desc,cat,date,added_by,month))
-    conn.commit(); conn.close()
+    month = date[:7]
+    tx_id = int(datetime.now().timestamp() * 1000)
+    p = ph()
+    _execute(
+        f"INSERT INTO transactions "
+        f"(id,chat_id,type,amount,description,category,date,added_by,month) "
+        f"VALUES ({p},{p},{p},{p},{p},{p},{p},{p},{p})",
+        (tx_id, chat_id, type_, amount, desc, cat, date, added_by, month)
+    )
     return tx_id, date, month, type_, amount, cat, desc, added_by
 
 def del_tx(tx_id, chat_id):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"DELETE FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
-    conn.commit(); conn.close()
+    p = ph()
+    _execute(f"DELETE FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
 
 def update_tx_category(tx_id, chat_id, new_cat):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"UPDATE transactions SET category={p} WHERE id={p} AND chat_id={p}", (new_cat, tx_id, chat_id))
-    conn.commit(); conn.close()
+    p = ph()
+    _execute(
+        f"UPDATE transactions SET category={p} WHERE id={p} AND chat_id={p}",
+        (new_cat, tx_id, chat_id)
+    )
 
 def get_tx(tx_id, chat_id):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE id={p} AND chat_id={p}", (tx_id, chat_id))
-    row = cur.fetchone(); conn.close(); return row
-
-def get_budgets(chat_id):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT category, amount FROM budgets WHERE chat_id={p}", (chat_id,))
-    rows = cur.fetchall(); conn.close(); return {r[0]:r[1] for r in rows}
-
-def set_budget(chat_id, cat, amount):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    if t=="pg":
-        cur.execute(f"INSERT INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p}) ON CONFLICT (chat_id,category) DO UPDATE SET amount={p}", (chat_id,cat,amount,amount))
-    else:
-        cur.execute(f"INSERT OR REPLACE INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p})", (chat_id,cat,amount))
-    conn.commit(); conn.close()
-
-def get_recurring(chat_id):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT id,chat_id,amount,description,category,day_of_month FROM recurring WHERE chat_id={p}", (chat_id,))
-    rows = cur.fetchall(); conn.close(); return rows
-
-def add_recurring(chat_id, amount, desc, cat, day):
-    r_id = int(datetime.now().timestamp()*1000)
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"INSERT INTO recurring (id,chat_id,amount,description,category,day_of_month) VALUES ({p},{p},{p},{p},{p},{p})", (r_id,chat_id,amount,desc,cat,day))
-    conn.commit(); conn.close()
-
-def del_recurring(r_id, chat_id):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"DELETE FROM recurring WHERE id={p} AND chat_id={p}", (r_id, chat_id))
-    conn.commit(); conn.close()
+    p = ph()
+    return _execute(
+        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
+        f"FROM transactions WHERE id={p} AND chat_id={p}",
+        (tx_id, chat_id), fetch="one"
+    )
 
 def get_txs_by_date(chat_id, date_str):
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT id,chat_id,type,amount,description,category,date,added_by,month FROM transactions WHERE chat_id={p} AND date={p} ORDER BY id ASC", (chat_id, date_str))
-    rows = cur.fetchall(); conn.close(); return rows
+    p = ph()
+    rows = _execute(
+        f"SELECT id,chat_id,type,amount,description,category,date,added_by,month "
+        f"FROM transactions WHERE chat_id={p} AND date={p} ORDER BY id ASC",
+        (chat_id, date_str), fetch="all"
+    )
+    return rows or []
 
 def get_all_chats():
-    conn, _ = get_conn(); cur = conn.cursor()
-    cur.execute("SELECT DISTINCT chat_id FROM transactions")
-    rows = cur.fetchall(); conn.close(); return [r[0] for r in rows]
+    rows = _execute("SELECT DISTINCT chat_id FROM transactions", fetch="all")
+    return [r[0] for r in rows] if rows else []
+
+# ── BUDGET FUNCTIONS ──────────────────────────────────────────────────────────
+
+def get_budgets(chat_id):
+    p = ph()
+    rows = _execute(
+        f"SELECT category, amount FROM budgets WHERE chat_id={p}", (chat_id,), fetch="all"
+    )
+    return {r[0]: r[1] for r in rows} if rows else {}
+
+def set_budget(chat_id, cat, amount):
+    p = ph()
+    if _DB_TYPE == "pg":
+        _execute(
+            f"INSERT INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p}) "
+            f"ON CONFLICT (chat_id,category) DO UPDATE SET amount={p}",
+            (chat_id, cat, amount, amount)
+        )
+    else:
+        _execute(
+            f"INSERT OR REPLACE INTO budgets (chat_id,category,amount) VALUES ({p},{p},{p})",
+            (chat_id, cat, amount)
+        )
+
+# ── RECURRING FUNCTIONS ───────────────────────────────────────────────────────
+
+def get_recurring(chat_id):
+    p = ph()
+    rows = _execute(
+        f"SELECT id,chat_id,amount,description,category,day_of_month "
+        f"FROM recurring WHERE chat_id={p}",
+        (chat_id,), fetch="all"
+    )
+    return rows or []
+
+def add_recurring(chat_id, amount, desc, cat, day):
+    r_id = int(datetime.now().timestamp() * 1000)
+    p = ph()
+    _execute(
+        f"INSERT INTO recurring (id,chat_id,amount,description,category,day_of_month) "
+        f"VALUES ({p},{p},{p},{p},{p},{p})",
+        (r_id, chat_id, amount, desc, cat, day)
+    )
+
+def del_recurring(r_id, chat_id):
+    p = ph()
+    _execute(f"DELETE FROM recurring WHERE id={p} AND chat_id={p}", (r_id, chat_id))
 
 # ── LEARNED MAPPINGS ──────────────────────────────────────────────────────────
 
 def get_learned_mappings(chat_id):
-    """Return {keyword: category} dict for this chat."""
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    cur.execute(f"SELECT keyword, category FROM learned_mappings WHERE chat_id={p} ORDER BY count DESC", (chat_id,))
-    rows = cur.fetchall(); conn.close()
-    return {r[0]: r[1] for r in rows}
+    """Return {keyword: category} dict for this chat, most-used first."""
+    p = ph()
+    rows = _execute(
+        f"SELECT keyword, category FROM learned_mappings "
+        f"WHERE chat_id={p} ORDER BY count DESC",
+        (chat_id,), fetch="all"
+    )
+    return {r[0]: r[1] for r in rows} if rows else {}
 
 def save_learned_mapping(chat_id, desc, category):
-    """
-    Normalise the description to keywords and upsert into learned_mappings.
-    We store the full normalised description as the key (simple but effective).
-    """
+    """Upsert a confirmed description→category mapping for future guessing."""
     keyword = desc.lower().strip()
-    if not keyword: return
-    conn, t = get_conn(); p = ph(t); cur = conn.cursor()
-    if t == "pg":
-        cur.execute(
-            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) VALUES ({p},{p},{p},1) "
-            f"ON CONFLICT (chat_id,keyword) DO UPDATE SET category={p}, count=learned_mappings.count+1",
+    if not keyword:
+        return
+    p = ph()
+    if _DB_TYPE == "pg":
+        _execute(
+            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) "
+            f"VALUES ({p},{p},{p},1) "
+            f"ON CONFLICT (chat_id,keyword) "
+            f"DO UPDATE SET category={p}, count=learned_mappings.count+1",
             (chat_id, keyword, category, category)
         )
     else:
-        cur.execute(
-            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) VALUES ({p},{p},{p},1) "
-            f"ON CONFLICT(chat_id,keyword) DO UPDATE SET category={p}, count=count+1",
+        _execute(
+            f"INSERT INTO learned_mappings (chat_id,keyword,category,count) "
+            f"VALUES ({p},{p},{p},1) "
+            f"ON CONFLICT(chat_id,keyword) "
+            f"DO UPDATE SET category={p}, count=count+1",
             (chat_id, keyword, category, category)
         )
-    conn.commit(); conn.close()
 
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
@@ -378,15 +508,27 @@ def gs_refresh_all(chat_id):
         except Exception as e: print(f"{label} error: {e}")
         time.sleep(3)
 
-async def gs_sync_async(chat_id, tx_id=None, date=None, month=None, type_=None, amount=None, cat=None, desc=None, added_by=None, delete=False, update_category=False):
+async def gs_sync_async(chat_id, tx_id=None, date=None, month=None, type_=None, amount=None, cat=None, desc=None, added_by=None, delete=False, update_category=False, bot=None):
+    """Sync to Google Sheets. Pass bot= to enable failure notifications to the user."""
     loop = asyncio.get_event_loop()
-    if delete and tx_id:
-        await loop.run_in_executor(None, gs_delete_tx, tx_id)
-    elif update_category and tx_id and cat:
-        await loop.run_in_executor(None, gs_update_tx_category, tx_id, cat)
-    elif tx_id:
-        await loop.run_in_executor(None, gs_append_tx, tx_id, date, month, type_, amount, cat, desc, added_by)
-    await loop.run_in_executor(None, gs_refresh_all, chat_id)
+    try:
+        if delete and tx_id:
+            await loop.run_in_executor(None, gs_delete_tx, tx_id)
+        elif update_category and tx_id and cat:
+            await loop.run_in_executor(None, gs_update_tx_category, tx_id, cat)
+        elif tx_id:
+            await loop.run_in_executor(None, gs_append_tx, tx_id, date, month, type_, amount, cat, desc, added_by)
+        await loop.run_in_executor(None, gs_refresh_all, chat_id)
+    except Exception as e:
+        print(f"gs_sync_async error for {chat_id}: {e}")
+        if bot:
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ *Sheets sync failed* — your transaction is saved in the database but the Google Sheet may be out of date. Try /refreshsheets later.",
+                    parse_mode="Markdown"
+                )
+            except Exception: pass
 
 
 def fmt(n): return f"${n:,.2f}"
@@ -582,6 +724,7 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id  = str(update.effective_chat.id)
     added_by = update.effective_user.first_name or "Someone"
+    desc = desc[:100]  # cap at 100 chars — Telegram UI truncates beyond this
 
     # Detect income from description keywords
     if _is_income_desc(desc):
@@ -619,7 +762,7 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         for cat in CATS:
             row.append(InlineKeyboardButton(
                 f"{CAT_ICONS.get(cat, chr(8226))} {cat.split('/')[0]}",
-                callback_data=f"quickcat_{tx_id}_{cat}"
+                callback_data=f"quickcat|id|{tx_id}|{cat}"
             ))
             if len(row) == 2: keyboard.append(row); row = []
         if row: keyboard.append(row)
@@ -632,11 +775,12 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await check_budget_alert(update, ctx, chat_id, guessed_cat)
     else:
         # No guess — show category picker without logging yet
+        safe_desc = desc[:30].replace("|", "-")  # | is our separator
         keyboard = []; row = []
         for cat in CATS:
             row.append(InlineKeyboardButton(
                 f"{CAT_ICONS.get(cat, chr(8226))} {cat.split('/')[0]}",
-                callback_data=f"quickcat_{amount}_{desc[:20]}_{cat}"
+                callback_data=f"quickcat|new|{amount}|{safe_desc}|{cat}"
             ))
             if len(row) == 2: keyboard.append(row); row = []
         if row: keyboard.append(row)
@@ -647,21 +791,31 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Callback data format (| separator — safe against underscores in descriptions):
+      Already-logged tx:  quickcat|id|<tx_id>|<category>
+      Unknown category:   quickcat|new|<amount>|<desc>|<category>
+    """
     query = update.callback_query; await query.answer()
     chat_id = str(update.effective_chat.id)
-    parts = query.data.replace("quickcat_", "").split("_")
-    updated_cat = "_".join(parts[1:]) if parts else ""
-    try: maybe_id = int(parts[0])
-    except: maybe_id = None
+    parts = query.data.split("|")   # ["quickcat", mode, ...]
 
-    if maybe_id is not None and updated_cat in CATS:
-        # Updating category of an already-logged transaction
-        tx = get_tx(maybe_id, chat_id)
+    mode = parts[1] if len(parts) > 1 else ""
+
+    if mode == "id":
+        # Already logged — just update the category
+        try: tx_id = int(parts[2])
+        except: await query.edit_message_text("⚠️ Invalid callback data."); return
+        updated_cat = parts[3] if len(parts) > 3 else ""
+        if updated_cat not in CATS:
+            await query.edit_message_text("⚠️ Unknown category."); return
+
+        tx = get_tx(tx_id, chat_id)
         if not tx:
             await query.edit_message_text("⚠️ Couldn't find that transaction.", parse_mode="Markdown")
             return
-        update_tx_category(maybe_id, chat_id, updated_cat)
-        asyncio.create_task(gs_sync_async(chat_id, tx_id=maybe_id, cat=updated_cat, update_category=True))
+        update_tx_category(tx_id, chat_id, updated_cat)
+        asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, cat=updated_cat, update_category=True))
         icon = CAT_ICONS.get(updated_cat, "•")
 
         # ── Learn from this correction ────────────────────────────────────────
@@ -675,10 +829,13 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await check_budget_alert_query(query, ctx, chat_id, updated_cat)
         return
 
-    # Logging a new transaction (category was unknown)
-    amount  = float(parts[0])
-    desc    = parts[1]
-    cat     = "_".join(parts[2:])
+    # mode == "new" — logging a transaction whose category was unknown
+    try: amount = float(parts[2])
+    except: await query.edit_message_text("⚠️ Invalid amount."); return
+    desc = parts[3] if len(parts) > 3 else ""
+    cat  = parts[4] if len(parts) > 4 else ""
+    if cat not in CATS:
+        await query.edit_message_text("⚠️ Unknown category."); return
 
     for t in get_txs(chat_id):
         if t[3] == amount and t[4] == desc:
@@ -769,7 +926,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         items_text=("\n"+"\n".join(f"  • {i}" for i in items[:5])) if items else ""
         keyboard=[]; row=[]
         for cat in CATS:
-            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat_{tx_id}_{cat}"))
+            row.append(InlineKeyboardButton(f"{CAT_ICONS.get(cat,chr(8226))} {cat.split('/')[0]}",callback_data=f"quickcat|id|{tx_id}|{cat}"))
             if len(row)==2: keyboard.append(row); row=[]
         if row: keyboard.append(row)
         await scanning_msg.edit_text(
@@ -1173,8 +1330,18 @@ async def process_recurring(app):
         for r in get_recurring(chat_id):
             if r[5]==today.day:
                 date=today.strftime("%Y-%m-%d")
+                # ── Duplicate guard: skip if already logged today ──────────────
+                existing = get_txs_by_date(chat_id, date)
+                already_logged = any(
+                    t[4] == r[3] and t[3] == r[2] and t[2] == "expense"
+                    for t in existing
+                )
+                if already_logged:
+                    print(f"Recurring skip (already logged): {r[3]} for {chat_id}")
+                    continue
+                # ─────────────────────────────────────────────────────────────
                 tx_info=add_tx(chat_id,"expense",r[2],r[3],r[4],date,"Auto")
-                asyncio.create_task(gs_sync_async(chat_id,*tx_info))
+                asyncio.create_task(gs_sync_async(chat_id,*tx_info,bot=app.bot))
                 try:
                     await app.bot.send_message(chat_id=chat_id,
                         text=f"🔁 *Recurring logged!*\n\n{CAT_ICONS.get(r[4],chr(8226))} *{r[4]}*\n💸 {fmt(r[2])} — {r[3]}",
@@ -1205,7 +1372,7 @@ def main():
         app.add_handler(CommandHandler("refreshsheets",refresh_sheets_cmd))
         app.add_handler(CommandHandler("who",who_cmd))
         app.add_handler(CallbackQueryHandler(delete_callback,pattern="^del_"))
-        app.add_handler(CallbackQueryHandler(quickcat_callback,pattern="^quickcat_"))
+        app.add_handler(CallbackQueryHandler(quickcat_callback,pattern="^quickcat"))
         app.add_handler(CallbackQueryHandler(budcat_callback,pattern="^budcat_"))
         app.add_handler(CallbackQueryHandler(delrec_callback,pattern="^delrec_"))
         app.add_handler(CallbackQueryHandler(daily_callback,pattern="^daily_"))
