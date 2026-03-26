@@ -1,7 +1,7 @@
 import os, sqlite3, re, base64, httpx, asyncio, json, time, difflib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, ConversationHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 TOKEN             = os.environ.get("BOT_TOKEN", "")
@@ -9,6 +9,21 @@ DATABASE_URL      = os.environ.get("DATABASE_URL", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 GOOGLE_SHEETS_CREDS = os.environ.get("GOOGLE_SHEETS_CREDS", "")
 GOOGLE_SHEET_ID     = os.environ.get("GOOGLE_SHEET_ID", "")
+
+# Singapore timezone (UTC+8)
+SGT = timezone(timedelta(hours=8))
+
+def now_sgt() -> datetime:
+    """Current datetime in Singapore time."""
+    return datetime.now(SGT)
+
+def today_sgt() -> str:
+    """Today's date string in Singapore time (YYYY-MM-DD)."""
+    return now_sgt().strftime("%Y-%m-%d")
+
+def get_month() -> str:
+    """Current month string in Singapore time (YYYY-MM)."""
+    return now_sgt().strftime("%Y-%m")
 
 # CATS order is FIXED — never reorder. Chart ranges A2:C10 depend on row stability.
 CATS = [
@@ -33,13 +48,9 @@ CAT_KEYWORDS = {
     "Savings":["savings","save","investment","invest","cpf","srs","endowment","stocks","etf"],
     "Personal/Shopping":["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon","taobao","uniqlo","zara","h&m"],
 }
-
-# Keywords with strong category signal but lower weight (generic food terms)
 CAT_KEYWORDS_LOW = {
     "Groceries": ["food","market","fresh","produce"],
 }
-
-# Keywords that suggest a message is income rather than an expense
 INCOME_KEYWORDS = [
     "salary","paycheck","payday","pay","wage","bonus","dividend","refund",
     "reimbursement","allowance","freelance","invoice","transfer in","received",
@@ -48,88 +59,86 @@ INCOME_KEYWORDS = [
 
 
 # ── CONNECTION POOL ───────────────────────────────────────────────────────────
-# Neon free tier: 10 connections max.
-# We use 1–3 so the rest stay available for Neon's own overhead + future use.
-# SQLite uses a single persistent connection (no pool needed).
 
-_sqlite_conn = None   # reused for the lifetime of the process
-_pg_pool     = None   # psycopg2 ThreadedConnectionPool
+_sqlite_conn = None
+_pg_pool     = None
 _DB_TYPE     = "sqlite"
 
 def _init_pool():
-    """Called once at startup from init_db(). Sets up the right backend."""
     global _sqlite_conn, _pg_pool, _DB_TYPE
     if DATABASE_URL:
         import psycopg2.pool
         _pg_pool = psycopg2.pool.ThreadedConnectionPool(
             minconn=1,
-            maxconn=3,   # safe for Neon free tier (limit is 10)
+            maxconn=3,
             dsn=DATABASE_URL.replace("postgres://", "postgresql://", 1)
         )
         _DB_TYPE = "pg"
         print("PostgreSQL pool initialised (1–3 connections, Neon-safe)")
     else:
         _sqlite_conn = sqlite3.connect("budget.db", check_same_thread=False)
-        _sqlite_conn.isolation_level = None   # autocommit mode
+        _sqlite_conn.isolation_level = None
         _DB_TYPE = "sqlite"
         print("SQLite connection initialised")
 
 def _get_conn():
-    """
-    Borrow a connection from the pool (Postgres) or return the
-    shared SQLite connection. Always pair with _release_conn().
-    """
     if _pg_pool:
         return _pg_pool.getconn(), True
     return _sqlite_conn, False
 
 def _release_conn(conn, pooled: bool):
-    """Return a Postgres connection to the pool. No-op for SQLite."""
     if pooled and _pg_pool:
         _pg_pool.putconn(conn)
 
-def ph(): return "%s" if _DB_TYPE == "pg" else "?"
+def ph():
+    return "%s" if _DB_TYPE == "pg" else "?"
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
 
-def _execute(query: str, params: tuple = (), *, fetch: str = "none"):
+def _execute(query: str, params: tuple = (), *, fetch: str = "none", retries: int = 3):
     """
-    Central query runner. Borrows a connection, runs the query,
-    releases back to pool in finally block, returns rows or None.
-
-    fetch: "none" | "one" | "all"
-    Writes (INSERT/UPDATE/DELETE) are committed automatically.
+    Central query runner with retry logic for Neon cold-start latency.
+    Neon free tier suspends after 5 min idle; first query may time out.
+    retries=3 gives the DB time to wake up before failing.
     """
-    conn, pooled = _get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(query, params)
-        if fetch == "all":
-            return cur.fetchall()
-        if fetch == "one":
-            return cur.fetchone()
-        # write — commit for SQLite (Postgres autocommits via pool default)
-        if _DB_TYPE == "sqlite":
-            conn.commit()
-        else:
-            conn.commit()
-        return None
-    except Exception as e:
-        print(f"DB error: {e}\nQuery: {query}\nParams: {params}")
+    last_err = None
+    for attempt in range(retries):
+        conn, pooled = _get_conn()
         try:
-            conn.rollback()
-        except Exception:
-            pass
-        raise
-    finally:
-        _release_conn(conn, pooled)
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if fetch == "all":
+                return cur.fetchall()
+            if fetch == "one":
+                return cur.fetchone()
+            conn.commit()
+            return None
+        except Exception as e:
+            last_err = e
+            print(f"DB error (attempt {attempt+1}/{retries}): {e}\nQuery: {query}\nParams: {params}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s backoff
+        finally:
+            _release_conn(conn, pooled)
+    raise last_err
+
+def _ping_db():
+    """Wake Neon from suspension. Call at startup and before scheduled jobs."""
+    try:
+        _execute("SELECT 1")
+        print("DB ping OK")
+        return True
+    except Exception as e:
+        print(f"DB ping failed: {e}")
+        return False
 
 def init_db():
-    """Create tables, indexes, and initialise the connection pool."""
     _init_pool()
-    p = ph()
 
-    # Tables
     _execute("""CREATE TABLE IF NOT EXISTS transactions (
         id BIGINT PRIMARY KEY, chat_id TEXT, type TEXT, amount REAL,
         description TEXT, category TEXT, date TEXT, added_by TEXT, month TEXT
@@ -153,7 +162,6 @@ def init_db():
         PRIMARY KEY (chat_id, keyword)
     )""")
 
-    # Indexes — speeds up the most common query patterns
     _execute("CREATE INDEX IF NOT EXISTS idx_tx_chat_month ON transactions(chat_id, month)")
     _execute("CREATE INDEX IF NOT EXISTS idx_tx_chat_date  ON transactions(chat_id, date)")
     _execute("CREATE INDEX IF NOT EXISTS idx_learned_chat  ON learned_mappings(chat_id)")
@@ -175,7 +183,7 @@ def get_txs(chat_id, month=None):
 
 def add_tx(chat_id, type_, amount, desc, cat, date, added_by):
     month = date[:7]
-    tx_id = int(datetime.now().timestamp() * 1000)
+    tx_id = int(now_sgt().timestamp() * 1000)
     p = ph()
     _execute(
         f"INSERT INTO transactions "
@@ -214,8 +222,10 @@ def get_txs_by_date(chat_id, date_str):
     return rows or []
 
 def get_all_chats():
-    rows = _execute("SELECT DISTINCT chat_id FROM transactions", fetch="all")
-    return [r[0] for r in rows] if rows else []
+    # Include chats that have recurring expenses even if no transactions yet
+    tx_rows  = _execute("SELECT DISTINCT chat_id FROM transactions", fetch="all") or []
+    rec_rows = _execute("SELECT DISTINCT chat_id FROM recurring",    fetch="all") or []
+    return list({r[0] for r in tx_rows + rec_rows})
 
 # ── BUDGET FUNCTIONS ──────────────────────────────────────────────────────────
 
@@ -252,7 +262,7 @@ def get_recurring(chat_id):
     return rows or []
 
 def add_recurring(chat_id, amount, desc, cat, day):
-    r_id = int(datetime.now().timestamp() * 1000)
+    r_id = int(now_sgt().timestamp() * 1000)
     p = ph()
     _execute(
         f"INSERT INTO recurring (id,chat_id,amount,description,category,day_of_month) "
@@ -267,7 +277,6 @@ def del_recurring(r_id, chat_id):
 # ── LEARNED MAPPINGS ──────────────────────────────────────────────────────────
 
 def get_learned_mappings(chat_id):
-    """Return {keyword: category} dict for this chat, most-used first."""
     p = ph()
     rows = _execute(
         f"SELECT keyword, category FROM learned_mappings "
@@ -277,7 +286,6 @@ def get_learned_mappings(chat_id):
     return {r[0]: r[1] for r in rows} if rows else {}
 
 def save_learned_mapping(chat_id, desc, category):
-    """Upsert a confirmed description→category mapping for future guessing."""
     keyword = desc.lower().strip()
     if not keyword:
         return
@@ -440,7 +448,7 @@ def gs_refresh_dashboard(spreadsheet, chat_id):
     month        = get_month()
     budgets      = get_budgets(chat_id)
     income, spent, by_cat = calc_summary(chat_id, month)
-    last_month   = (datetime.now().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
+    last_month   = (now_sgt().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
     _, last_spent, _ = calc_summary(chat_id, last_month)
     total_budget = sum(budgets.values())
     remaining    = income-spent
@@ -448,7 +456,7 @@ def gs_refresh_dashboard(spreadsheet, chat_id):
     budget_pct   = round(spent/total_budget*100,1) if total_budget else 0
     mom_diff     = round(spent-last_spent,2)
     mom_arrow    = "\u25b2" if mom_diff>0 else "\u25bc"
-    updated_at   = datetime.now().strftime("%d %b %Y %H:%M")
+    updated_at   = now_sgt().strftime("%d %b %Y %H:%M")
     ws = _get_or_create_ws(spreadsheet, SHEET_DASH, [])
     sid = ws.id
     rows = [
@@ -509,7 +517,6 @@ def gs_refresh_all(chat_id):
         time.sleep(3)
 
 async def gs_sync_async(chat_id, tx_id=None, date=None, month=None, type_=None, amount=None, cat=None, desc=None, added_by=None, delete=False, update_category=False, bot=None):
-    """Sync to Google Sheets. Pass bot= to enable failure notifications to the user."""
     loop = asyncio.get_event_loop()
     try:
         if delete and tx_id:
@@ -531,8 +538,10 @@ async def gs_sync_async(chat_id, tx_id=None, date=None, month=None, type_=None, 
             except Exception: pass
 
 
+# ── UTILS ─────────────────────────────────────────────────────────────────────
+
 def fmt(n): return f"${n:,.2f}"
-def get_month(): return datetime.now().strftime("%Y-%m")
+
 def month_label(m=None):
     m = m or get_month()
     return datetime.strptime(m,"%Y-%m").strftime("%B %Y")
@@ -573,36 +582,27 @@ def main_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, persistent=True)
 
 
-# ── IMPROVED CATEGORY GUESSING ────────────────────────────────────────────────
+# ── CATEGORY GUESSING ─────────────────────────────────────────────────────────
 
 def _is_income_desc(desc: str) -> bool:
-    """Return True if the description sounds like income rather than an expense."""
     tl = desc.lower()
     return any(kw in tl for kw in INCOME_KEYWORDS)
 
 def _score_categories(desc: str) -> dict:
-    """
-    Return a score dict {category: score} using keyword matching + fuzzy matching.
-    High-confidence keywords score 3; low-confidence (generic) keywords score 1;
-    fuzzy matches score 1. Higher total = stronger match.
-    """
     tl = desc.lower()
     words = re.findall(r'\w+', tl)
     scores = {cat: 0 for cat in CATS}
 
     for cat, kws in CAT_KEYWORDS.items():
         for kw in kws:
-            # Exact substring match — high confidence
             if kw in tl:
                 scores[cat] += 3
                 continue
-            # Fuzzy word-level match — catches typos like "resturant"
             for word in words:
                 ratio = difflib.SequenceMatcher(None, word, kw).ratio()
-                if ratio >= 0.82:          # ~1-2 character difference
+                if ratio >= 0.82:
                     scores[cat] += 2
 
-    # Low-weight generic keywords (e.g. "food" could be Groceries OR Dining Out)
     for cat, kws in CAT_KEYWORDS_LOW.items():
         for kw in kws:
             if kw in tl:
@@ -611,34 +611,22 @@ def _score_categories(desc: str) -> dict:
     return scores
 
 def guess_category(desc: str, learned: dict | None = None) -> str | None:
-    """
-    Improved category guesser. Priority order:
-      1. Exact learned mapping (user-confirmed before)
-      2. Fuzzy learned mapping (close match to a learned key)
-      3. Multi-score keyword matching
-    Returns None if no confident guess.
-    """
     tl = desc.lower().strip()
 
-    # 1. Exact learned mapping
     if learned:
         if tl in learned:
             return learned[tl]
-
-        # 2. Fuzzy match against learned keys
         close = difflib.get_close_matches(tl, learned.keys(), n=1, cutoff=0.80)
         if close:
             return learned[close[0]]
 
-    # 3. Multi-category keyword scoring
     scores = _score_categories(desc)
-    best_cat  = max(scores, key=scores.get)
+    best_cat   = max(scores, key=scores.get)
     best_score = scores[best_cat]
 
     if best_score == 0:
-        return None  # No match at all → ask the user
+        return None
 
-    # If the best score is low and there's a tie, don't guess — ask instead
     top_two = sorted(scores.values(), reverse=True)[:2]
     if best_score < 2 and len(top_two) > 1 and top_two[0] == top_two[1]:
         return None
@@ -646,11 +634,6 @@ def guess_category(desc: str, learned: dict | None = None) -> str | None:
     return best_cat
 
 async def claude_categorise(desc: str) -> str | None:
-    """
-    Ask Claude to categorise a description when keyword matching fails.
-    Returns a category string or None on error.
-    Falls back gracefully — never blocks the user flow.
-    """
     if not ANTHROPIC_API_KEY:
         return None
     valid_cats = ", ".join(CATS)
@@ -676,11 +659,9 @@ async def claude_categorise(desc: str) -> str | None:
             if r.status_code != 200:
                 return None
             text = r.json()["content"][0]["text"].strip()
-            # Validate the response is actually one of our categories
             for cat in CATS:
                 if cat.lower() == text.lower():
                     return cat
-            # Partial match fallback
             for cat in CATS:
                 if cat.lower() in text.lower() or text.lower() in cat.lower():
                     return cat
@@ -690,12 +671,75 @@ async def claude_categorise(desc: str) -> str | None:
         return None
 
 
+# ── RECURRING: CATCH-UP LOGIC ─────────────────────────────────────────────────
+
+async def run_catchup_recurring(bot=None):
+    """
+    Called at startup and before the daily scheduler job.
+    Logs any recurring expense whose day-of-month has passed this month
+    but wasn't logged — catches missed jobs from Railway redeploys/restarts.
+    """
+    today = now_sgt()
+    today_str = today.strftime("%Y-%m-%d")
+    logged_count = 0
+
+    for chat_id in get_all_chats():
+        for r in get_recurring(chat_id):
+            r_id, _, amount, desc, cat, day = r
+
+            # Only process days that have already passed (or are today) this month
+            if day > today.day:
+                continue
+
+            # Build the date this recurring SHOULD have been logged on
+            try:
+                target_date = today.replace(day=day).strftime("%Y-%m-%d")
+            except ValueError:
+                # day > days in this month (e.g. day=31 in February) — skip
+                continue
+
+            # Check if it was already logged on that date
+            existing = get_txs_by_date(chat_id, target_date)
+            already_logged = any(
+                t[4] == desc and abs(t[3] - amount) < 0.01 and t[2] == "expense"
+                for t in existing
+            )
+
+            if already_logged:
+                continue
+
+            # Log the missed recurring with its correct target date
+            tx_info = add_tx(chat_id, "expense", amount, desc, cat, target_date, "Auto")
+            asyncio.create_task(gs_sync_async(chat_id, *tx_info, bot=bot))
+            logged_count += 1
+
+            catchup_tag = " _(catch-up)_" if target_date != today_str else ""
+            print(f"Recurring catch-up: {desc} ${amount} for {chat_id} on {target_date}")
+
+            if bot:
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🔁 *Recurring logged{catchup_tag}*\n\n"
+                            f"{CAT_ICONS.get(cat, '•')} *{cat}*\n"
+                            f"💸 {fmt(amount)} — {desc}\n"
+                            f"📅 _{target_date}_"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                except Exception as e:
+                    print(f"Recurring notify error for {chat_id}: {e}")
+
+    print(f"Recurring catch-up complete: {logged_count} transaction(s) logged.")
+
+
 # ── SMART ADD ────────────────────────────────────────────────────────────────
 
 async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Support "income 5000 salary" prefix
+    # "income 5000 salary" prefix
     income_prefix = re.match(r'^income\s+(\d+\.?\d*)\s*(.*)$', text, re.IGNORECASE)
     if income_prefix:
         try: amount = float(income_prefix.group(1))
@@ -703,7 +747,7 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         desc = income_prefix.group(2).strip() or "Income"
         chat_id = str(update.effective_chat.id)
         added_by = update.effective_user.first_name or "Someone"
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = today_sgt()
         tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
         asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         await update.message.reply_text(
@@ -712,7 +756,7 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Standard "amount description" pattern
+    # "amount description" pattern
     match = re.match(r'^(\d+\.?\d*)\s+(.+)$', text)
     if not match:
         return
@@ -724,11 +768,10 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     chat_id  = str(update.effective_chat.id)
     added_by = update.effective_user.first_name or "Someone"
-    desc = desc[:100]  # cap at 100 chars — Telegram UI truncates beyond this
+    desc = desc[:100]
 
-    # Detect income from description keywords
     if _is_income_desc(desc):
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = today_sgt()
         tx_info = add_tx(chat_id, "income", amount, desc, "Income", date, added_by)
         asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         await update.message.reply_text(
@@ -738,20 +781,16 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Load learned mappings for this chat
     learned = get_learned_mappings(chat_id)
-
-    # Try local guessing first (fast, free)
     guessed_cat = guess_category(desc, learned)
 
-    # Fall back to Claude if no confident local guess
     used_claude = False
     if guessed_cat is None and ANTHROPIC_API_KEY:
         guessed_cat = await claude_categorise(desc)
         used_claude = True
 
     if guessed_cat:
-        date    = datetime.now().strftime("%Y-%m-%d")
+        date    = today_sgt()
         tx_info = add_tx(chat_id, "expense", amount, desc, guessed_cat, date, added_by)
         asyncio.create_task(gs_sync_async(chat_id, *tx_info))
         tx_id = tx_info[0]
@@ -774,8 +813,7 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         await check_budget_alert(update, ctx, chat_id, guessed_cat)
     else:
-        # No guess — show category picker without logging yet
-        safe_desc = desc[:30].replace("|", "-")  # | is our separator
+        safe_desc = desc[:30].replace("|", "-")
         keyboard = []; row = []
         for cat in CATS:
             row.append(InlineKeyboardButton(
@@ -791,19 +829,12 @@ async def smart_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Callback data format (| separator — safe against underscores in descriptions):
-      Already-logged tx:  quickcat|id|<tx_id>|<category>
-      Unknown category:   quickcat|new|<amount>|<desc>|<category>
-    """
     query = update.callback_query; await query.answer()
     chat_id = str(update.effective_chat.id)
-    parts = query.data.split("|")   # ["quickcat", mode, ...]
-
+    parts = query.data.split("|")
     mode = parts[1] if len(parts) > 1 else ""
 
     if mode == "id":
-        # Already logged — just update the category
         try: tx_id = int(parts[2])
         except: await query.edit_message_text("⚠️ Invalid callback data."); return
         updated_cat = parts[3] if len(parts) > 3 else ""
@@ -817,11 +848,7 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         update_tx_category(tx_id, chat_id, updated_cat)
         asyncio.create_task(gs_sync_async(chat_id, tx_id=tx_id, cat=updated_cat, update_category=True))
         icon = CAT_ICONS.get(updated_cat, "•")
-
-        # ── Learn from this correction ────────────────────────────────────────
-        save_learned_mapping(chat_id, tx[4], updated_cat)   # tx[4] = description
-        # ─────────────────────────────────────────────────────────────────────
-
+        save_learned_mapping(chat_id, tx[4], updated_cat)
         await query.edit_message_text(
             f"✅ *Updated!*\n{icon} *{updated_cat}*\n💸 {fmt(tx[3])} — {tx[4]}\n👤 {tx[7]}",
             parse_mode="Markdown"
@@ -829,7 +856,7 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await check_budget_alert_query(query, ctx, chat_id, updated_cat)
         return
 
-    # mode == "new" — logging a transaction whose category was unknown
+    # mode == "new"
     try: amount = float(parts[2])
     except: await query.edit_message_text("⚠️ Invalid amount."); return
     desc = parts[3] if len(parts) > 3 else ""
@@ -843,14 +870,11 @@ async def quickcat_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             asyncio.create_task(gs_sync_async(chat_id, tx_id=t[0], delete=True))
             break
 
-    date     = datetime.now().strftime("%Y-%m-%d")
+    date     = today_sgt()
     added_by = update.effective_user.first_name or "Someone"
     tx_info  = add_tx(chat_id, "expense", amount, desc, cat, date, added_by)
     asyncio.create_task(gs_sync_async(chat_id, *tx_info))
-
-    # ── Learn from explicit user selection ───────────────────────────────────
     save_learned_mapping(chat_id, desc, cat)
-    # ─────────────────────────────────────────────────────────────────────────
 
     icon = CAT_ICONS.get(cat, "•")
     await query.edit_message_text(
@@ -880,6 +904,8 @@ async def check_budget_alert_query(query, ctx, chat_id, cat):
             parse_mode="Markdown"
         )
 
+
+# ── RECEIPT SCANNING ──────────────────────────────────────────────────────────
 
 async def scan_receipt_with_claude(image_bytes: bytes) -> dict:
     if not ANTHROPIC_API_KEY: return {"error": "ANTHROPIC_API_KEY not configured"}
@@ -917,7 +943,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await scanning_msg.edit_text(f"😕 *Couldn't read receipt*\n_{result['error']}_\n\nTry: `amount description`",parse_mode="Markdown"); return
         merchant=result.get("merchant","Unknown"); total=float(result.get("total",0))
         category=result.get("category","Personal/Shopping"); items=result.get("items",[])
-        date=result.get("date") or datetime.now().strftime("%Y-%m-%d"); confidence=result.get("confidence","medium")
+        date=result.get("date") or today_sgt(); confidence=result.get("confidence","medium")
         if total<=0:
             await scanning_msg.edit_text("😕 Couldn't find a total. Try clearer photo!"); return
         tx_info=add_tx(chat_id,"expense",total,merchant,category,date,added_by)
@@ -937,6 +963,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         print(f"Receipt scan error: {e}")
         await scanning_msg.edit_text("😕 Something went wrong. Try: `amount description`",parse_mode="Markdown")
 
+
+# ── COMMANDS ──────────────────────────────────────────────────────────────────
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -979,7 +1007,7 @@ async def add_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cat_input=args[1].lower()
     matched_cat=next((c for c in CATS if cat_input in c.lower() or c.lower().startswith(cat_input)),"Personal/Shopping")
     desc=" ".join(args[2:]) if len(args)>2 else matched_cat
-    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+    date=today_sgt(); added_by=update.effective_user.first_name or "Someone"
     tx_info=add_tx(chat_id,"expense",amount,desc,matched_cat,date,added_by)
     asyncio.create_task(gs_sync_async(chat_id,*tx_info))
     icon=CAT_ICONS.get(matched_cat,"•"); budgets=get_budgets(chat_id)
@@ -997,7 +1025,7 @@ async def add_income(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: amount=float(args[0].replace("$","").replace(",",""))
     except ValueError: await update.message.reply_text("❌ Invalid amount.",parse_mode="Markdown"); return
     desc=" ".join(args[1:]) if len(args)>1 else "Income"
-    date=datetime.now().strftime("%Y-%m-%d"); added_by=update.effective_user.first_name or "Someone"
+    date=today_sgt(); added_by=update.effective_user.first_name or "Someone"
     tx_info=add_tx(chat_id,"income",amount,desc,"Income",date,added_by)
     asyncio.create_task(gs_sync_async(chat_id,*tx_info))
     await update.message.reply_text(f"✅ *Income logged!*\n\n💵 *{fmt(amount)}* — {desc}\n👤 {added_by}",parse_mode="Markdown")
@@ -1024,7 +1052,7 @@ async def summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE, month=None):
 async def report_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id=str(update.effective_chat.id); month=get_month()
     income,spent,by_cat=calc_summary(chat_id,month); budgets=get_budgets(chat_id); total_budget=sum(budgets.values())
-    last_month=(datetime.now().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
+    last_month=(now_sgt().replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
     _,last_spent,_=calc_summary(chat_id,last_month); diff=spent-last_spent
     diff_str=f"{chr(128200)+' +' if diff>0 else chr(128201)+' ' }{fmt(abs(diff))} vs last month"
     pct_used=(spent/total_budget) if total_budget else 0; grade,grade_msg=get_grade(pct_used)
@@ -1153,7 +1181,7 @@ async def month_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await summary(update,ctx,month=args[0])
 
 async def daily_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _send_daily(update,str(update.effective_chat.id),datetime.now().strftime("%Y-%m-%d"),is_callback=False)
+    await _send_daily(update, str(update.effective_chat.id), today_sgt(), is_callback=False)
 
 async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback: bool):
     txs=get_txs_by_date(chat_id,date_str); expenses=[t for t in txs if t[2]=="expense"]
@@ -1170,9 +1198,9 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
     except: daily_budget_share=0; budget_left_today=0
     by_cat_today={}
     for t in expenses: by_cat_today[t[5]]=by_cat_today.get(t[5],0)+t[3]
-    today_dt=datetime.now().strftime("%Y-%m-%d"); date_dt=datetime.strptime(date_str,"%Y-%m-%d")
-    if date_str==today_dt: date_label=f"Today · {date_dt.strftime('%a, %d %b %Y')}"
-    elif date_str==(datetime.now()-timedelta(days=1)).strftime("%Y-%m-%d"): date_label=f"Yesterday · {date_dt.strftime('%a, %d %b %Y')}"
+    today_str=today_sgt(); date_dt=datetime.strptime(date_str,"%Y-%m-%d")
+    if date_str==today_str: date_label=f"Today · {date_dt.strftime('%a, %d %b %Y')}"
+    elif date_str==(now_sgt()-timedelta(days=1)).strftime("%Y-%m-%d"): date_label=f"Yesterday · {date_dt.strftime('%a, %d %b %Y')}"
     else: date_label=date_dt.strftime("%A, %d %b %Y")
     text=f"📅 *Daily Summary — {date_label}*\n{'-'*30}\n\n"
     if not expenses: text+="🎉 *No spending today!* 👏\n\n"
@@ -1201,7 +1229,8 @@ async def _send_daily(update_or_query, chat_id: str, date_str: str, is_callback:
     text+=f"\n📊 *{month_label(month)} so far:* {fmt(month_spent)}"
     if total_budget: text+=f"  /  {fmt(total_budget)}  {budget_status(month_spent/total_budget*100)}"
     text+="\n"
-    pivot=datetime.strptime(date_str,"%Y-%m-%d"); base_day=min(pivot,datetime.strptime(today_dt,"%Y-%m-%d"))
+    pivot=datetime.strptime(date_str,"%Y-%m-%d")
+    base_day=min(pivot, datetime.strptime(today_str,"%Y-%m-%d"))
     dates=[base_day-timedelta(days=i) for i in range(4,-1,-1)]; date_row=[]
     for d in dates:
         ds=d.strftime("%Y-%m-%d"); label=f"[{d.strftime('%d/%m')}]" if ds==date_str else d.strftime("%d/%m")
@@ -1216,9 +1245,52 @@ async def daily_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else: new_date=data.replace("daily_","")
     await _send_daily(query,chat_id,new_date,is_callback=True)
 
+async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    month   = get_month()
+    txs     = get_txs(chat_id, month)
+    expenses = [t for t in txs if t[2] == "expense"]
+
+    if not expenses:
+        await update.message.reply_text(f"No expenses logged yet for {month_label()}!", parse_mode="Markdown")
+        return
+
+    by_person = {}
+    by_person_cat = {}
+    total_spent = sum(t[3] for t in expenses)
+
+    for t in expenses:
+        person = t[7]; amount = t[3]; cat = t[5]
+        by_person[person] = by_person.get(person, 0) + amount
+        if person not in by_person_cat: by_person_cat[person] = {}
+        by_person_cat[person][cat] = by_person_cat[person].get(cat, 0) + amount
+
+    ranked = sorted(by_person.items(), key=lambda x: -x[1])
+    text = f"\U0001f46b *Who spent what — {month_label()}*\n{'─'*28}\n\n"
+    text += f"💸 *Total: {fmt(total_spent)}*\n\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (person, amount) in enumerate(ranked):
+        pct   = round(amount / total_spent * 100) if total_spent else 0
+        medal = medals[i] if i < len(medals) else "👤"
+        bar   = progress_bar(pct, 8)
+        text += f"{medal} *{person}*\n`{bar}` {fmt(amount)} ({pct}%)\n"
+        cats = sorted(by_person_cat[person].items(), key=lambda x: -x[1])[:3]
+        for cat, amt in cats:
+            text += f"  {CAT_ICONS.get(cat,'•')} {cat}: {fmt(amt)}\n"
+        text += "\n"
+    priciest = max(expenses, key=lambda t: t[3])
+    icon = CAT_ICONS.get(priciest[5], "•")
+    text += f"{'─'*28}\n🏷 *Biggest single spend:*\n{icon} {fmt(priciest[3])} — {priciest[4]}\n_{priciest[7]} on {datetime.strptime(priciest[6], '%Y-%m-%d').strftime('%d %b')}_"
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 async def handle_reply_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text=update.message.text
-    mapping={"📊 Summary":summary,"📋 Spent":spent_cmd,"🏆 Report":report_cmd,"🧾 Recent":recent,"👫 Who":who_cmd,"💰 Budgets":budgets_cmd,"🗑 Delete":delete_cmd,"🔁 Recurring":recurring_cmd,"❓ Help":help_cmd,"🔄 Sheets":refresh_sheets_cmd}
+    mapping={
+        "📊 Summary":summary,"📋 Spent":spent_cmd,"🏆 Report":report_cmd,
+        "🧾 Recent":recent,"👫 Who":who_cmd,"💰 Budgets":budgets_cmd,
+        "🗑 Delete":delete_cmd,"🔁 Recurring":recurring_cmd,
+        "❓ Help":help_cmd,"🔄 Sheets":refresh_sheets_cmd
+    }
     if text in mapping: await mapping[text](update,ctx)
     else: await smart_add(update,ctx)
 
@@ -1250,64 +1322,14 @@ async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• Line   → `Summary!A:D`",
         parse_mode="Markdown")
 
-async def who_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    month   = get_month()
-    txs     = get_txs(chat_id, month)
-    expenses = [t for t in txs if t[2] == "expense"]
-
-    if not expenses:
-        await update.message.reply_text(
-            f"No expenses logged yet for {month_label()}!",
-            parse_mode="Markdown"
-        )
-        return
-
-    by_person = {}
-    by_person_cat = {}
-    total_spent = sum(t[3] for t in expenses)
-
-    for t in expenses:
-        person = t[7]
-        amount = t[3]
-        cat    = t[5]
-        by_person[person]          = by_person.get(person, 0) + amount
-        if person not in by_person_cat:
-            by_person_cat[person]  = {}
-        by_person_cat[person][cat] = by_person_cat[person].get(cat, 0) + amount
-
-    ranked = sorted(by_person.items(), key=lambda x: -x[1])
-
-    text = f"\U0001f46b *Who spent what — {month_label()}*\n{'─'*28}\n\n"
-    text += f"💸 *Total: {fmt(total_spent)}*\n\n"
-
-    medals = ["🥇", "🥈", "🥉"]
-    for i, (person, amount) in enumerate(ranked):
-        pct    = round(amount / total_spent * 100) if total_spent else 0
-        medal  = medals[i] if i < len(medals) else "👤"
-        bar    = progress_bar(pct, 8)
-        text  += f"{medal} *{person}*\n"
-        text  += f"`{bar}` {fmt(amount)} ({pct}%)\n"
-
-        cats = sorted(by_person_cat[person].items(), key=lambda x: -x[1])[:3]
-        for cat, amt in cats:
-            icon  = CAT_ICONS.get(cat, "•")
-            text += f"  {icon} {cat}: {fmt(amt)}\n"
-        text += "\n"
-
-    priciest = max(expenses, key=lambda t: t[3])
-    icon = CAT_ICONS.get(priciest[5], "•")
-    text += f"{'─'*28}\n"
-    text += f"🏷 *Biggest single spend:*\n{icon} {fmt(priciest[3])} — {priciest[4]}\n_{priciest[7]} on {datetime.strptime(priciest[6], '%Y-%m-%d').strftime('%d %b')}_"
-
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
 async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🤷 Unknown command. Type /help to see all commands.")
 
 
+# ── SCHEDULED JOBS ────────────────────────────────────────────────────────────
+
 async def weekly_digest(app):
+    _ping_db()  # wake Neon before querying
     for chat_id in get_all_chats():
         try:
             month=get_month(); income,spent,by_cat=calc_summary(chat_id,month)
@@ -1325,69 +1347,129 @@ async def weekly_digest(app):
         except Exception as e: print(f"Weekly digest error for {chat_id}: {e}")
 
 async def process_recurring(app):
-    today=datetime.now()
+    """
+    Daily job — logs recurring expenses whose day matches today (SGT).
+    The catch-up logic in post_init handles any missed days from restarts.
+    """
+    _ping_db()  # wake Neon before querying
+    today = now_sgt()
+    today_str = today.strftime("%Y-%m-%d")
+    print(f"process_recurring fired: {today_str} (SGT)")
+
     for chat_id in get_all_chats():
         for r in get_recurring(chat_id):
-            if r[5]==today.day:
-                date=today.strftime("%Y-%m-%d")
-                # ── Duplicate guard: skip if already logged today ──────────────
-                existing = get_txs_by_date(chat_id, date)
-                already_logged = any(
-                    t[4] == r[3] and t[3] == r[2] and t[2] == "expense"
-                    for t in existing
+            if r[5] != today.day:
+                continue
+
+            # Duplicate guard
+            existing = get_txs_by_date(chat_id, today_str)
+            already_logged = any(
+                t[4] == r[3] and abs(t[3] - r[2]) < 0.01 and t[2] == "expense"
+                for t in existing
+            )
+            if already_logged:
+                print(f"Recurring skip (already logged): {r[3]} for {chat_id}")
+                continue
+
+            tx_info = add_tx(chat_id, "expense", r[2], r[3], r[4], today_str, "Auto")
+            asyncio.create_task(gs_sync_async(chat_id, *tx_info, bot=app.bot))
+            print(f"Recurring logged: {r[3]} ${r[2]} for {chat_id}")
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔁 *Recurring logged!*\n\n"
+                        f"{CAT_ICONS.get(r[4], '•')} *{r[4]}*\n"
+                        f"💸 {fmt(r[2])} — {r[3]}"
+                    ),
+                    parse_mode="Markdown"
                 )
-                if already_logged:
-                    print(f"Recurring skip (already logged): {r[3]} for {chat_id}")
-                    continue
-                # ─────────────────────────────────────────────────────────────
-                tx_info=add_tx(chat_id,"expense",r[2],r[3],r[4],date,"Auto")
-                asyncio.create_task(gs_sync_async(chat_id,*tx_info,bot=app.bot))
-                try:
-                    await app.bot.send_message(chat_id=chat_id,
-                        text=f"🔁 *Recurring logged!*\n\n{CAT_ICONS.get(r[4],chr(8226))} *{r[4]}*\n💸 {fmt(r[2])} — {r[3]}",
-                        parse_mode="Markdown")
-                except Exception as e: print(f"Recurring error: {e}")
+            except Exception as e:
+                print(f"Recurring notify error: {e}")
+
+
+# ── STARTUP ───────────────────────────────────────────────────────────────────
+
+async def post_init(app):
+    """
+    Runs once after the bot starts up.
+    1. Wakes the Neon DB (handles cold-start latency).
+    2. Runs catch-up recurring — logs anything missed while the bot was down.
+    """
+    print("post_init: waking DB...")
+    for attempt in range(3):
+        if _ping_db():
+            break
+        print(f"DB wake attempt {attempt+1} failed, retrying...")
+        await asyncio.sleep(2 ** attempt)
+
+    print("post_init: running recurring catch-up...")
+    try:
+        await run_catchup_recurring(bot=app.bot)
+    except Exception as e:
+        print(f"post_init catch-up error: {e}")
+
+    print("post_init complete.")
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
-    if not TOKEN: print("ERROR: BOT_TOKEN not set!"); return
+    if not TOKEN:
+        print("ERROR: BOT_TOKEN not set!")
+        return
+
     print(f"Starting... token: {TOKEN[:10]}")
-    print(f"DB: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    print(f"DB: {'PostgreSQL (Neon)' if DATABASE_URL else 'SQLite'}")
     init_db()
+
     try:
-        app=Application.builder().token(TOKEN).build()
-        app.add_handler(CommandHandler("start",start))
-        app.add_handler(CommandHandler("help",help_cmd))
-        app.add_handler(CommandHandler("add",add_expense))
-        app.add_handler(CommandHandler("income",add_income))
-        app.add_handler(CommandHandler("summary",summary))
-        app.add_handler(CommandHandler("spent",spent_cmd))
-        app.add_handler(CommandHandler("report",report_cmd))
-        app.add_handler(CommandHandler("recent",recent))
-        app.add_handler(CommandHandler("delete",delete_cmd))
-        app.add_handler(CommandHandler("budget",budget_cmd))
-        app.add_handler(CommandHandler("budgets",budgets_cmd))
-        app.add_handler(CommandHandler("recurring",recurring_cmd))
-        app.add_handler(CommandHandler("month",month_cmd))
-        app.add_handler(CommandHandler("daily",daily_cmd))
-        app.add_handler(CommandHandler("refreshsheets",refresh_sheets_cmd))
-        app.add_handler(CommandHandler("who",who_cmd))
-        app.add_handler(CallbackQueryHandler(delete_callback,pattern="^del_"))
-        app.add_handler(CallbackQueryHandler(quickcat_callback,pattern="^quickcat"))
-        app.add_handler(CallbackQueryHandler(budcat_callback,pattern="^budcat_"))
-        app.add_handler(CallbackQueryHandler(delrec_callback,pattern="^delrec_"))
-        app.add_handler(CallbackQueryHandler(daily_callback,pattern="^daily_"))
-        app.add_handler(MessageHandler(filters.PHOTO,handle_photo))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_reply_keyboard))
-        app.add_handler(MessageHandler(filters.COMMAND,unknown))
-        scheduler=AsyncIOScheduler()
-        scheduler.add_job(weekly_digest,"cron",day_of_week="sun",hour=9,minute=0,args=[app])
-        scheduler.add_job(process_recurring,"cron",hour=8,minute=0,args=[app])
+        app = (
+            Application.builder()
+            .token(TOKEN)
+            .post_init(post_init)   # ← runs DB wake + recurring catch-up on every start
+            .build()
+        )
+
+        app.add_handler(CommandHandler("start",       start))
+        app.add_handler(CommandHandler("help",        help_cmd))
+        app.add_handler(CommandHandler("add",         add_expense))
+        app.add_handler(CommandHandler("income",      add_income))
+        app.add_handler(CommandHandler("summary",     summary))
+        app.add_handler(CommandHandler("spent",       spent_cmd))
+        app.add_handler(CommandHandler("report",      report_cmd))
+        app.add_handler(CommandHandler("recent",      recent))
+        app.add_handler(CommandHandler("delete",      delete_cmd))
+        app.add_handler(CommandHandler("budget",      budget_cmd))
+        app.add_handler(CommandHandler("budgets",     budgets_cmd))
+        app.add_handler(CommandHandler("recurring",   recurring_cmd))
+        app.add_handler(CommandHandler("month",       month_cmd))
+        app.add_handler(CommandHandler("daily",       daily_cmd))
+        app.add_handler(CommandHandler("refreshsheets", refresh_sheets_cmd))
+        app.add_handler(CommandHandler("who",         who_cmd))
+
+        app.add_handler(CallbackQueryHandler(delete_callback,   pattern="^del_"))
+        app.add_handler(CallbackQueryHandler(quickcat_callback, pattern="^quickcat"))
+        app.add_handler(CallbackQueryHandler(budcat_callback,   pattern="^budcat_"))
+        app.add_handler(CallbackQueryHandler(delrec_callback,   pattern="^delrec_"))
+        app.add_handler(CallbackQueryHandler(daily_callback,    pattern="^daily_"))
+
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_keyboard))
+        app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+        scheduler = AsyncIOScheduler(timezone="Asia/Singapore")
+        scheduler.add_job(weekly_digest,    "cron", day_of_week="sun", hour=9,  minute=0, args=[app])
+        scheduler.add_job(process_recurring,"cron", hour=8, minute=0,           args=[app])
         scheduler.start()
+
         print("🤖 Budget bot is running!")
         app.run_polling(drop_pending_updates=True)
+
     except Exception as e:
         print(f"FATAL ERROR: {e}")
-        import traceback; traceback.print_exc(); raise
+        import traceback; traceback.print_exc()
+        raise
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
