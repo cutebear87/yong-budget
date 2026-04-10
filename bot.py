@@ -25,15 +25,17 @@ def get_month() -> str:
     """Current month string in Singapore time (YYYY-MM)."""
     return now_sgt().strftime("%Y-%m")
 
-# CATS order is FIXED — never reorder. Chart ranges A2:C10 depend on row stability.
+# CATS order is FIXED — never reorder. Chart ranges A2:C12 depend on row stability.
 CATS = [
     "Housing/Rent", "Groceries", "Dining Out", "Subscriptions",
-    "Transportation", "Utilities", "Entertainment", "Savings", "Personal/Shopping"
+    "Transportation", "Utilities", "Entertainment", "Savings", "Personal/Shopping",
+    "Holiday", "ASY"
 ]
 CAT_ICONS = {
     "Housing/Rent":"🏠","Groceries":"🛒","Dining Out":"🍽",
     "Subscriptions":"📱","Transportation":"🚗","Utilities":"⚡",
-    "Entertainment":"🎬","Savings":"💰","Personal/Shopping":"🛍","Income":"💵"
+    "Entertainment":"🎬","Savings":"💰","Personal/Shopping":"🛍","Income":"💵",
+    "Holiday":"✈️","ASY":"👶"
 }
 CAT_KEYWORDS = {
     "Groceries":["grocery","groceries","supermarket","fairprice","ntuc","cold storage","giant","walmart","costco"],
@@ -47,6 +49,8 @@ CAT_KEYWORDS = {
     "Housing/Rent":["rent","mortgage","condo","hdb","housing","property","maintenance","strata"],
     "Savings":["savings","save","investment","invest","cpf","srs","endowment","stocks","etf"],
     "Personal/Shopping":["shopping","clothes","shoes","haircut","gym","beauty","personal","lazada","shopee","amazon","taobao","uniqlo","zara","h&m"],
+    "Holiday":["flight","hotel","airbnb","holiday","vacation","resort","tour","visa","booking","airfare","travel","overseas","cruise","staycation"],
+    "ASY":["asy","childcare","nanny","infant","babysitter","daycare","school fee","tuition","milk formula","diapers","pampers"],
 }
 CAT_KEYWORDS_LOW = {
     "Groceries": ["food","market","fresh","produce"],
@@ -1317,8 +1321,8 @@ async def refresh_sheets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else: await msg.edit_text(
         "✅ *Google Sheets updated!*\n\n"
         "Your chart ranges:\n"
-        "• Donut  → `Budget Tracker!A2:A10, C2:C10`\n"
-        "• Bar    → `Budget Tracker!A2:C10`\n"
+        "• Donut  → `Budget Tracker!A2:A12, C2:C12`\n"
+        "• Bar    → `Budget Tracker!A2:C12`\n"
         "• Line   → `Summary!A:D`",
         parse_mode="Markdown")
 
